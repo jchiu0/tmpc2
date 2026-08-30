@@ -21,6 +21,55 @@ Set `GITHUB_TOKEN` or `GH_TOKEN` to a token with repository contents write
 access. The script uses GitHub APIs for both checkout and publishing. Restart
 the MCP server after changing its implementation.
 
+## Run the asynchronous service
+
+Start Redis and the API from the project root:
+
+```bash
+brew services start redis
+cloud_agent/.venv/bin/python -m uvicorn \
+  cloud_agent.service.app:app --host 127.0.0.1 --port 8001
+```
+
+Run a worker in another terminal. The worker continuously blocks on the Redis
+Stream, processes runs, commits their SQLite results, acknowledges each
+message, and waits for the next run:
+
+```bash
+GITHUB_TOKEN="$(gh auth token)" \
+  cloud_agent/.venv/bin/python -m cloud_agent.service.worker
+```
+
+Create an agent and its first run:
+
+```bash
+curl -X POST http://127.0.0.1:8001/v1/agents \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "prompt": {
+      "text": "Create QUEUE_E2E.md describing the Redis worker flow."
+    },
+    "repos": [{
+      "url": "https://github.com/jchiu0/scratch1",
+      "startingRef": "cursor/create-a-concise-readme-md-expla-386dcb"
+    }],
+    "name": "Verify Redis worker end to end",
+    "workOnCurrentBranch": false,
+    "autoCreatePR": false,
+    "outputBranch": "cursor/redis-e2e"
+  }'
+```
+
+The endpoint returns Cursor-shaped `agent` and `run` objects. The first run is
+returned as `CREATING`; the worker transitions it to `RUNNING`, then
+`FINISHED` or `ERROR`. Agent, run, result, and event state is stored in
+`cloud_agent/data/cloud_agents.db`.
+
+Worker execution is idempotent by `runId`. Generated branch names are stable,
+published commits include the run ID, and stale-run recovery recognizes a
+commit that was pushed before a worker crash. A lease heartbeat prevents
+healthy long-running work from being auto-claimed by another worker.
+
 ## Create a generated branch
 
 From the project root:

@@ -1,2 +1,5 @@
+fastapi
 httpx
 mcp[cli]
+redis
+uvicorn

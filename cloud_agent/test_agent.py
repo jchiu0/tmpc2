@@ -1,12 +1,16 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from agent import (
+from cloud_agent.lib.runner import (
+    AgentRequest,
     AgentError,
+    commit_marker,
     generated_branch,
     parse_action,
     read_file,
+    run_agent,
     safe_path,
     select_branches,
     workspace_digest,
@@ -81,6 +85,37 @@ class BranchTests(unittest.TestCase):
             before = workspace_digest(root)
             write_file(root, "README.md", "# Test\n")
             self.assertNotEqual(before, workspace_digest(root))
+
+
+class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovers_already_published_run(self) -> None:
+        class FakeGitHub:
+            def __init__(self, _: str):
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def get_ref(self, _: str) -> str:
+                return "published-sha"
+
+            def commit_message(self, _: str) -> str:
+                return commit_marker("run-123") + " completed"
+
+            def close(self) -> None:
+                pass
+
+        request = AgentRequest(
+            prompt="Create a README",
+            repo="https://github.com/example/repo",
+            starting_ref="main",
+            output_branch="cursor/test",
+            idempotency_key="run-123",
+        )
+        with patch("cloud_agent.lib.runner.GitHubGitApi", FakeGitHub):
+            result = await run_agent(request)
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["commit"], "published-sha")
 
 
 if __name__ == "__main__":

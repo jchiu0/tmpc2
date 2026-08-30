@@ -62,6 +62,12 @@ class GitHubGitApi:
     def default_branch(self) -> str:
         return self._json(self.client.get(self.base_path))["default_branch"]
 
+    def commit_message(self, commit_sha: str) -> str:
+        data = self._json(
+            self.client.get(f"{self.base_path}/git/commits/{commit_sha}")
+        )
+        return str(data["message"])
+
     def has_refs(self) -> bool:
         response = self.client.get(f"{self.base_path}/git/refs")
         if response.status_code in {404, 409}:
