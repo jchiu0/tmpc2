@@ -1,6 +1,6 @@
 import unittest
 
-from github_api import GitHubApiError, repository_name
+from cloud_agent.lib.github import GitHubApiError, repository_name
 
 
 class RepositoryNameTests(unittest.TestCase):

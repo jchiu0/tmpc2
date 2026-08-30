@@ -253,28 +253,43 @@ Available actions:
 Use only relative paths. Inspect relevant files before editing them. Write complete
 file contents. Do not request shell commands. Finish only when the task is done.
 """.strip()
-    messages = [
-        {"role": "system", "content": instructions},
-        *history,
-        {
-            "role": "user",
-            "content": f"""
+    current_prompt = f"""
 Task:
 {prompt}
 
 Return the first JSON action.
-""".strip(),
-        },
+""".strip()
+    messages = [
+        {"role": "system", "content": instructions},
+        *history,
+        {"role": "user", "content": current_prompt},
     ]
+    await emit(
+        on_event,
+        "conversation.message",
+        {"role": "user", "kind": "prompt", "content": current_prompt},
+    )
 
     async with Client(mcp_url) as client:
         raw = await ask(client, messages)
         for _ in range(MAX_STEPS):
-            await emit(on_event, "agent.response", {"content": raw})
             action = parse_action(raw)
             name = action["action"]
+            await emit(
+                on_event,
+                "conversation.message",
+                {
+                    "role": "assistant",
+                    "kind": (
+                        "final_response" if name == "finish" else "tool_call"
+                    ),
+                    "content": raw,
+                },
+            )
             if name == "finish":
-                return str(action.get("summary", "Completed requested changes"))
+                return str(
+                    action.get("summary", "Completed requested changes")
+                )
             if name == "list_files":
                 result: Any = {
                     "files": list_files(workspace, str(action.get("path", ".")))
@@ -294,17 +309,24 @@ Return the first JSON action.
             else:
                 result = {"error": f"unknown action: {name}"}
 
-            messages.extend(
-                [
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": f"""
+            tool_result = f"""
 Action result:
 {json.dumps(result)}
 Return the next JSON action.
-""".strip(),
-                    },
+""".strip()
+            await emit(
+                on_event,
+                "conversation.message",
+                {
+                    "role": "user",
+                    "kind": "tool_result",
+                    "content": tool_result,
+                },
+            )
+            messages.extend(
+                [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content": tool_result},
                 ]
             )
             raw = await ask(client, messages)

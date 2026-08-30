@@ -209,7 +209,12 @@ class AgentStore:
         }
 
     def create_run(
-        self, agent_id: str, run_id: str, prompt: str, mcp_url: str
+        self,
+        agent_id: str,
+        run_id: str,
+        prompt: str,
+        mcp_url: str,
+        output_branch: str | None = None,
     ) -> dict[str, Any]:
         timestamp = now()
         try:
@@ -223,25 +228,32 @@ class AgentStore:
                 if agent["status"] == "ARCHIVED":
                     raise AgentBusyError(agent_id)
 
-                previous = connection.execute(
+                published = connection.execute(
                     """
-                    SELECT result_json FROM runs
+                    SELECT 1 FROM runs
                     WHERE agent_id = ? AND status = 'FINISHED'
-                    ORDER BY created_at DESC, run_id DESC LIMIT 1
+                      AND result_json IS NOT NULL
+                      AND json_extract(result_json, '$.commit') IS NOT NULL
+                    LIMIT 1
                     """,
                     (agent_id,),
                 ).fetchone()
-                branch_exists = False
-                if previous and previous["result_json"]:
-                    branch_exists = bool(
-                        json.loads(previous["result_json"]).get("commit")
+                if output_branch is not None:
+                    starting_ref = (
+                        agent["working_branch"]
+                        if agent["work_on_current_branch"] or published
+                        else agent["starting_ref"]
                     )
-                if agent["work_on_current_branch"] or branch_exists:
+                    work_on_current_branch = False
+                    selected_output_branch = output_branch
+                elif agent["work_on_current_branch"] or published:
                     starting_ref = agent["working_branch"]
                     work_on_current_branch = True
+                    selected_output_branch = agent["working_branch"]
                 else:
                     starting_ref = agent["starting_ref"]
                     work_on_current_branch = False
+                    selected_output_branch = agent["working_branch"]
 
                 connection.execute(
                     """
@@ -257,7 +269,7 @@ class AgentStore:
                         prompt,
                         starting_ref,
                         int(work_on_current_branch),
-                        agent["working_branch"],
+                        selected_output_branch,
                         mcp_url,
                         timestamp,
                         timestamp,
@@ -302,7 +314,7 @@ class AgentStore:
                 return []
             rows = connection.execute(
                 """
-                SELECT prompt, assistant_output
+                SELECT run_id, prompt, assistant_output
                 FROM runs
                 WHERE agent_id = ? AND status = 'FINISHED'
                   AND assistant_output IS NOT NULL AND created_at < ?
@@ -310,12 +322,49 @@ class AgentStore:
                 """,
                 (current["agent_id"], current["created_at"]),
             ).fetchall()
-        messages: list[dict[str, str]] = []
-        for row in rows:
-            messages.append({"role": "user", "content": row["prompt"]})
-            messages.append(
-                {"role": "assistant", "content": row["assistant_output"]}
-            )
+            messages: list[dict[str, str]] = []
+            for row in rows:
+                transcript = connection.execute(
+                    """
+                    SELECT
+                        json_extract(payload_json, '$.role') AS role,
+                        json_extract(payload_json, '$.content') AS content
+                    FROM run_events
+                    WHERE run_id = ?
+                      AND event_type = 'conversation.message'
+                      AND json_extract(payload_json, '$.attempt') = (
+                          SELECT MAX(
+                              json_extract(payload_json, '$.attempt')
+                          )
+                          FROM run_events
+                          WHERE run_id = ?
+                            AND event_type = 'conversation.message'
+                            AND json_extract(
+                                payload_json, '$.kind'
+                            ) = 'final_response'
+                      )
+                    ORDER BY id
+                    """,
+                    (row["run_id"], row["run_id"]),
+                ).fetchall()
+                if transcript:
+                    messages.extend(
+                        {
+                            "role": message["role"],
+                            "content": message["content"],
+                        }
+                        for message in transcript
+                    )
+                else:
+                    messages.append(
+                        {"role": "user", "content": row["prompt"]}
+                    )
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": row["assistant_output"],
+                        }
+                    )
         return messages
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
@@ -329,6 +378,22 @@ class AgentStore:
                 (run_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def list_events(
+        self, run_id: str, after_id: int = 0, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, run_id, event_type, payload_json, created_at
+                FROM run_events
+                WHERE run_id = ? AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (run_id, after_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def claim_execution(self, run_id: str) -> dict[str, Any] | None:
         timestamp = now()

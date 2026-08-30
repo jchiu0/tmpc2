@@ -71,10 +71,15 @@ def process_message(
     def save_event(event_type: str, payload: dict) -> None:
         if not queue.refresh_lease(consumer, message.message_id):
             raise StaleExecutionError(message.run_id)
+        if event_type == "conversation.message":
+            payload = {**payload, "attempt": epoch}
         store.append_event(message.run_id, epoch, event_type, payload)
         if event_type == "agent.status" and payload.get("status") == "running":
             logger.info("grok_started run_id=%s", message.run_id)
-        elif event_type == "agent.response":
+        elif (
+            event_type == "conversation.message"
+            and payload.get("role") == "assistant"
+        ):
             logger.info("grok_response_received run_id=%s", message.run_id)
 
     stop_heartbeat = threading.Event()

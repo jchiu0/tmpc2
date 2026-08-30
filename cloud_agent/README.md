@@ -74,8 +74,37 @@ curl -X POST http://127.0.0.1:8001/v1/agents/AGENT_ID/runs \
 ```
 
 Only one run may be active per agent. Follow-ups reuse the agent's Git branch
-and send each prior finished run's prompt and final output to Grok as
-conversation history.
+and send each prior finished run's ordered prompt, assistant tool calls, tool
+results, and final response to Grok as conversation history. System
+instructions are regenerated for the current run.
+
+Poll a run's durable events and current status:
+
+```bash
+curl "http://127.0.0.1:8001/v1/agents/AGENT_ID/runs/RUN_ID/events?after=0&limit=100"
+```
+
+The response contains ordered status, conversation, retry, response, and
+terminal events plus `status` and `nextCursor`. Pass `nextCursor` as the next
+request's `after` value. An empty event list means there are no new events;
+continue polling until `status` is terminal.
+
+Run the real two-run polling and conversation-continuation check:
+
+```bash
+cloud_agent/.venv/bin/python cloud_agent/manual_tests/multiple_runs.py
+```
+
+This starts an isolated API and one-shot workers, uses a unique Redis stream
+and database, and verifies that the second run reuses both the first run's
+conversation result and Git branch.
+
+To verify one agent chaining follow-up work onto a new output branch:
+
+```bash
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/multiple_runs_multiple_branches.py
+```
 
 Worker execution is idempotent by `runId`. Generated branch names are stable,
 published commits include the run ID, and stale-run recovery recognizes a
