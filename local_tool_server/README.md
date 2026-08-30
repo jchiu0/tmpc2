@@ -1,10 +1,24 @@
 # Local Grok Tool Server
 
-This local MCP server exposes one tool:
+This local MCP server exposes one stateless tool:
 
-- `ask_grok(prompt)` sends a message to Grok and returns its response.
+- `ask_grok(messages, model?)` sends a list of system, user, and assistant
+  messages to Grok and returns its response.
 
-The server retains conversation context in memory until it restarts.
+Example input:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a coding assistant."},
+    {"role": "user", "content": "Build a todo API."}
+  ]
+}
+```
+
+Grok responses are cached on disk under `.cache/grok`. The SHA-256 cache key
+includes the model and complete message list. The cache maps that request to the
+corresponding Grok response and is excluded from Git.
 
 ## Start
 
@@ -42,4 +56,4 @@ Add this project-level configuration to `.cursor/mcp.json`:
 }
 ```
 
-Restart the server to clear its in-memory Grok conversation.
+The server does not retain conversation state between calls.
