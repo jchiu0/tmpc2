@@ -258,7 +258,12 @@ file contents. Do not request shell commands. Finish only when the task is done.
         *history,
         {
             "role": "user",
-            "content": f"Task:\n{prompt}\n\nReturn the first JSON action.",
+            "content": f"""
+Task:
+{prompt}
+
+Return the first JSON action.
+""".strip(),
         },
     ]
 
@@ -294,9 +299,11 @@ file contents. Do not request shell commands. Finish only when the task is done.
                     {"role": "assistant", "content": raw},
                     {
                         "role": "user",
-                        "content": "Action result:\n"
-                        + json.dumps(result)
-                        + "\nReturn the next JSON action.",
+                        "content": f"""
+Action result:
+{json.dumps(result)}
+Return the next JSON action.
+""".strip(),
                     },
                 ]
             )

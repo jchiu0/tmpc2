@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from cloud_agent.lib import runner as runner_module
 from cloud_agent.service import app as app_module
 from cloud_agent.service.queue import AgentQueue, QueueMessage
 from cloud_agent.service.storage import (
@@ -272,6 +274,137 @@ class ServiceTests(unittest.TestCase):
         )
         self.assertEqual(queue.acknowledgements, 1)
         self.assertEqual(executions, 1)
+
+    def test_crash_after_git_publish_recovers_before_sqlite_finish(self) -> None:
+        self.store.initialize()
+        self.store.create_agent_and_run(
+            agent_id="bc-git-crash",
+            run_id="run-git-crash",
+            name="Git crash",
+            prompt="""
+Create README.md.
+Explain that this repository tests Git publication recovery.
+""".strip(),
+            repo_url="https://github.com/example/repo",
+            starting_ref="main",
+            working_branch="cursor/git-crash",
+            work_on_current_branch=False,
+            auto_create_pr=False,
+            output_branch="cursor/git-crash",
+            mcp_url="http://127.0.0.1:8765/mcp",
+        )
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        class RecordingQueue:
+            def __init__(self):
+                self.acknowledgements = 0
+
+            def refresh_lease(self, consumer: str, message_id: str) -> bool:
+                return True
+
+            def acknowledge_if_owned(
+                self, consumer: str, message_id: str
+            ) -> bool:
+                self.acknowledgements += 1
+                return True
+
+        state = {
+            "branch_head": None,
+            "commit_messages": {},
+            "commits": 0,
+            "edits": 0,
+            "crash_after_write": True,
+        }
+
+        class FakeGitHub:
+            def __init__(self, repo: str):
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def get_ref(self, branch: str) -> str | None:
+                return state["branch_head"]
+
+            def commit_message(self, commit_sha: str) -> str:
+                return state["commit_messages"][commit_sha]
+
+            def download_ref(self, ref: str, destination: Path) -> str:
+                destination.mkdir()
+                (destination / "base.txt").write_text("base\n")
+                return "base-sha"
+
+            def create_commit(
+                self, workspace: Path, message: str, parent_sha: str
+            ) -> str:
+                state["commits"] += 1
+                commit_sha = f"commit-{state['commits']}"
+                state["commit_messages"][commit_sha] = message
+                return commit_sha
+
+            def write_ref(
+                self, branch: str, commit_sha: str, previous_sha: str | None
+            ) -> None:
+                state["branch_head"] = commit_sha
+                if state["crash_after_write"]:
+                    state["crash_after_write"] = False
+                    raise SimulatedCrash
+
+            def close(self) -> None:
+                pass
+
+        async def edit(
+            workspace: Path,
+            prompt: str,
+            mcp_url: str,
+            on_event=None,
+            history=(),
+        ) -> str:
+            state["edits"] += 1
+            (workspace / "README.md").write_text("# Recovered\n")
+            return "README created"
+
+        message = QueueMessage("message-2", "run-git-crash")
+        queue = RecordingQueue()
+        with (
+            patch("cloud_agent.lib.runner.GitHubGitApi", FakeGitHub),
+            patch("cloud_agent.lib.runner.edit_with_grok", edit),
+        ):
+            with self.assertRaises(SimulatedCrash):
+                process_message(
+                    message,
+                    self.store,
+                    queue,
+                    "worker-a",
+                    stale_after_ms=60_000,
+                    executor=runner_module.run_agent,
+                )
+
+            interrupted = self.store.get_run(message.run_id)
+            self.assertEqual(interrupted["status"], "RUNNING")
+            self.assertEqual(interrupted["attempt_count"], 1)
+            self.assertEqual(queue.acknowledgements, 0)
+
+            process_message(
+                message,
+                self.store,
+                queue,
+                "worker-b",
+                stale_after_ms=60_000,
+                executor=runner_module.run_agent,
+            )
+
+        recovered = self.store.get_run(message.run_id)
+        result = json.loads(recovered["result_json"])
+        self.assertEqual(recovered["status"], "FINISHED")
+        self.assertEqual(recovered["attempt_count"], 2)
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["commit"], "commit-1")
+        self.assertEqual(state["commits"], 1)
+        self.assertEqual(state["edits"], 1)
+        self.assertEqual(queue.acknowledgements, 1)
 
     def test_killed_worker_message_is_autoclaimed(self) -> None:
         self.queue.initialize()
