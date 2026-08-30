@@ -133,6 +133,11 @@ def process_message(
         )
         return
     except Exception as error:
+        if not queue.refresh_lease(consumer, message.message_id):
+            logger.warning(
+                "failure_ownership_lost run_id=%s", message.run_id
+            )
+            return
         try:
             store.fail(message.run_id, epoch, str(error))
         except StaleExecutionError:

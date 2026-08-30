@@ -65,6 +65,18 @@ returned as `CREATING`; the worker transitions it to `RUNNING`, then
 `FINISHED` or `ERROR`. Agent, run, result, and event state is stored in
 `cloud_agent/data/cloud_agents.db`.
 
+After that run finishes, create a follow-up on the same agent:
+
+```bash
+curl -X POST http://127.0.0.1:8001/v1/agents/AGENT_ID/runs \
+  -H 'Content-Type: application/json' \
+  --data '{"prompt":{"text":"Also add tests"}}'
+```
+
+Only one run may be active per agent. Follow-ups reuse the agent's Git branch
+and send each prior finished run's prompt and final output to Grok as
+conversation history.
+
 Worker execution is idempotent by `runId`. Generated branch names are stable,
 published commits include the run ID, and stale-run recovery recognizes a
 commit that was pushed before a worker crash. A lease heartbeat prevents

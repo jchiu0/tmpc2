@@ -11,7 +11,11 @@ from fastapi.testclient import TestClient
 
 from cloud_agent.service import app as app_module
 from cloud_agent.service.queue import AgentQueue
-from cloud_agent.service.storage import AgentStore
+from cloud_agent.service.storage import (
+    AgentBusyError,
+    AgentStore,
+    StaleExecutionError,
+)
 
 
 HOLD_PENDING_SCRIPT = """
@@ -81,6 +85,19 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(queued.run_id, created["run"]["id"])
             self.queue.acknowledge(queued.message_id)
 
+            busy = client.post(
+                f"/v1/agents/{created['agent']['id']}/runs",
+                json={"prompt": {"text": "Also add tests"}},
+            )
+            self.assertEqual(busy.status_code, 409)
+            self.assertEqual(busy.json()["detail"]["code"], "agent_busy")
+
+            missing = client.post(
+                "/v1/agents/bc-missing/runs",
+                json={"prompt": {"text": "Also add tests"}},
+            )
+            self.assertEqual(missing.status_code, 404)
+
     def test_claim_checks_agent_and_run_and_counts_retries(self) -> None:
         self.store.initialize()
         self.store.create_agent_and_run(
@@ -102,11 +119,72 @@ class ServiceTests(unittest.TestCase):
 
         retry = self.store.claim_execution("run-test")
         self.assertEqual(retry["attempt_count"], 2)
+        with self.assertRaises(StaleExecutionError):
+            self.store.append_event(
+                "run-test", 1, "agent.response", {"content": "stale"}
+            )
+        with self.assertRaises(StaleExecutionError):
+            self.store.finish(
+                "run-test", 1, {"status": "finished", "summary": "stale"}
+            )
 
         self.store.finish(
-            "run-test", 2, {"status": "finished", "summary": "done"}
+            "run-test",
+            2,
+            {
+                "status": "finished",
+                "summary": "done",
+                "branch": "cursor/test",
+                "commit": "abc123",
+            },
         )
         self.assertIsNone(self.store.claim_execution("run-test"))
+
+    def test_followup_reuses_branch_and_previous_output(self) -> None:
+        self.store.initialize()
+        self.store.create_agent_and_run(
+            agent_id="bc-followup",
+            run_id="run-first",
+            name="Followup",
+            prompt="Create a README",
+            repo_url="https://github.com/example/repo",
+            starting_ref="main",
+            working_branch="cursor/followup",
+            work_on_current_branch=False,
+            auto_create_pr=False,
+            output_branch="cursor/followup",
+            mcp_url="http://127.0.0.1:8765/mcp",
+        )
+        with self.assertRaises(AgentBusyError):
+            self.store.create_run(
+                "bc-followup", "run-too-soon", "Too soon", "mcp"
+            )
+
+        first = self.store.claim_execution("run-first")
+        self.store.finish(
+            "run-first",
+            first["attempt_count"],
+            {
+                "status": "finished",
+                "summary": "README created",
+                "branch": "cursor/followup",
+                "commit": "abc123",
+            },
+        )
+        created = self.store.create_run(
+            "bc-followup", "run-second", "Add tests", "mcp"
+        )
+        self.assertEqual(created["run"]["status"], "CREATING")
+        second = self.store.get_run("run-second")
+        self.assertEqual(second["starting_ref"], "cursor/followup")
+        self.assertEqual(second["work_on_current_branch"], 1)
+        self.assertEqual(
+            self.store.conversation_before("run-second"),
+            [
+                {"role": "user", "content": "Create a README"},
+                {"role": "assistant", "content": "README created"},
+            ],
+        )
 
     def test_killed_worker_message_is_autoclaimed(self) -> None:
         self.queue.initialize()
@@ -146,6 +224,11 @@ class ServiceTests(unittest.TestCase):
             claimed = self.queue.claim_stale("worker-b", min_idle_ms=100)
             self.assertEqual(len(claimed), 1)
             self.assertEqual(claimed[0].run_id, "run-lease-test")
+            self.assertFalse(
+                self.queue.refresh_lease(
+                    "worker-a", claimed[0].message_id
+                )
+            )
             self.queue.acknowledge(claimed[0].message_id)
         finally:
             if worker_a.poll() is None:

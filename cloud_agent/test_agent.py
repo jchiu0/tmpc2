@@ -1,12 +1,14 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cloud_agent.lib.runner import (
     AgentRequest,
     AgentError,
     commit_marker,
+    edit_with_grok,
     generated_branch,
     parse_action,
     read_file,
@@ -88,6 +90,107 @@ class BranchTests(unittest.TestCase):
 
 
 class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recovery_publishes_prepared_commit(self) -> None:
+        writes: list[tuple[str, str, str | None]] = []
+
+        class FakeGitHub:
+            def __init__(self, _: str):
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def get_ref(self, branch: str) -> str | None:
+                return None if branch == "cursor/test" else "base"
+
+            def write_ref(
+                self, branch: str, commit: str, previous: str | None
+            ) -> None:
+                writes.append((branch, commit, previous))
+
+            def close(self) -> None:
+                pass
+
+        request = AgentRequest(
+            prompt="Create a README",
+            repo="https://github.com/example/repo",
+            starting_ref="main",
+            output_branch="cursor/test",
+            idempotency_key="run-123",
+            prepared_commit_sha="prepared-sha",
+            prepared_branch="cursor/test",
+            prepared_output="README created",
+        )
+        with patch("cloud_agent.lib.runner.GitHubGitApi", FakeGitHub):
+            result = await run_agent(request)
+        self.assertEqual(writes, [("cursor/test", "prepared-sha", None)])
+        self.assertEqual(result["commit"], "prepared-sha")
+        self.assertEqual(result["summary"], "README created")
+
+    async def test_recovery_rejects_changed_branch(self) -> None:
+        class FakeGitHub:
+            def __init__(self, _: str):
+                pass
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def get_ref(self, _: str) -> str:
+                return "unexpected-sha"
+
+            def close(self) -> None:
+                pass
+
+        request = AgentRequest(
+            prompt="Create a README",
+            repo="https://github.com/example/repo",
+            starting_ref="main",
+            output_branch="cursor/test",
+            idempotency_key="run-123",
+            prepared_commit_sha="prepared-sha",
+            prepared_parent_sha="expected-parent",
+            prepared_branch="cursor/test",
+        )
+        with patch("cloud_agent.lib.runner.GitHubGitApi", FakeGitHub):
+            with self.assertRaises(AgentError):
+                await run_agent(request)
+
+    async def test_prior_run_history_precedes_current_prompt(self) -> None:
+        captured: list[dict[str, str]] = []
+
+        class FakeClient:
+            def __init__(self, _: str):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return None
+
+            async def call_tool(self, _: str, arguments: dict):
+                captured.extend(arguments["messages"])
+                return SimpleNamespace(
+                    is_error=False,
+                    structured_content={
+                        "result": '{"action":"finish","summary":"done"}'
+                    },
+                    content=[],
+                )
+
+        history = (
+            {"role": "user", "content": "Create a README"},
+            {"role": "assistant", "content": "README created"},
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("cloud_agent.lib.runner.Client", FakeClient):
+                summary = await edit_with_grok(
+                    Path(temp), "Add tests", "http://mcp", history=history
+                )
+        self.assertEqual(summary, "done")
+        self.assertEqual(captured[1:3], list(history))
+        self.assertIn("Add tests", captured[3]["content"])
+
     async def test_recovers_already_published_run(self) -> None:
         class FakeGitHub:
             def __init__(self, _: str):
