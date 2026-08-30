@@ -91,7 +91,12 @@ class BranchTests(unittest.TestCase):
 
 class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_prior_run_history_precedes_current_prompt(self) -> None:
-        captured: list[dict[str, str]] = []
+        requests: list[list[dict[str, str]]] = []
+        responses = [
+            '{"action":"write_file","path":"tests.txt","content":"covered"}',
+            '{"action":"finish","summary":"done"}',
+        ]
+        events: list[tuple[str, dict]] = []
 
         class FakeClient:
             def __init__(self, _: str):
@@ -104,12 +109,10 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def call_tool(self, _: str, arguments: dict):
-                captured.extend(arguments["messages"])
+                requests.append(list(arguments["messages"]))
                 return SimpleNamespace(
                     is_error=False,
-                    structured_content={
-                        "result": '{"action":"finish","summary":"done"}'
-                    },
+                    structured_content={"result": responses.pop(0)},
                     content=[],
                 )
 
@@ -120,11 +123,54 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             with patch("cloud_agent.lib.runner.Client", FakeClient):
                 summary = await edit_with_grok(
-                    Path(temp), "Add tests", "http://mcp", history=history
+                    Path(temp),
+                    "Add tests",
+                    "http://mcp",
+                    on_event=lambda event_type, payload: events.append(
+                        (event_type, payload)
+                    ),
+                    history=history,
                 )
         self.assertEqual(summary, "done")
-        self.assertEqual(captured[1:3], list(history))
-        self.assertIn("Add tests", captured[3]["content"])
+        self.assertEqual(requests[0][1:3], list(history))
+        self.assertIn("Add tests", requests[0][3]["content"])
+        self.assertEqual(
+            requests[1][-2:],
+            [
+                {
+                    "role": "assistant",
+                    "content": (
+                        '{"action":"write_file","path":"tests.txt",'
+                        '"content":"covered"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        'Action result:\n{"written": "tests.txt"}\n'
+                        "Return the next JSON action."
+                    ),
+                },
+            ],
+        )
+        conversation = [
+            payload
+            for event_type, payload in events
+            if event_type == "conversation.message"
+        ]
+        self.assertEqual(
+            [message["kind"] for message in conversation],
+            [
+                "prompt",
+                "tool_call",
+                "tool_result",
+                "final_response",
+            ],
+        )
+        self.assertEqual(
+            conversation[-1]["content"],
+            '{"action":"finish","summary":"done"}',
+        )
 
     async def test_recovers_already_published_run(self) -> None:
         class FakeGitHub:

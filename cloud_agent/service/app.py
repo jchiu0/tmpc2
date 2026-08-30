@@ -1,9 +1,10 @@
 import hashlib
+import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, HttpUrl
 from redis.exceptions import RedisError
 
@@ -65,10 +66,26 @@ class CreateAgentResponse(BaseModel):
 
 class CreateRunRequest(BaseModel):
     prompt: Prompt
+    outputBranch: str | None = None
 
 
 class CreateRunResponse(BaseModel):
     run: RunResponse
+
+
+class EventResponse(BaseModel):
+    id: int
+    runId: str
+    type: str
+    payload: dict[str, Any]
+    createdAt: str
+
+
+class GetEventsResponse(BaseModel):
+    runId: str
+    status: str
+    events: list[EventResponse]
+    nextCursor: str
 
 
 settings = load_settings()
@@ -146,7 +163,11 @@ def create_run(
     run_id = f"run-{uuid.uuid4()}"
     try:
         created = store.create_run(
-            agent_id, run_id, request.prompt.text, settings.mcp_url
+            agent_id,
+            run_id,
+            request.prompt.text,
+            settings.mcp_url,
+            request.outputBranch,
         )
     except AgentNotFoundError as error:
         raise HTTPException(status_code=404, detail="agent not found") from error
@@ -165,3 +186,41 @@ def create_run(
             detail=f"run {run_id} was saved but could not be queued",
         ) from error
     return created
+
+
+@app.get(
+    "/v1/agents/{agent_id}/runs/{run_id}/events",
+    response_model=GetEventsResponse,
+)
+def get_run_events(
+    agent_id: str,
+    run_id: str,
+    after: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    try:
+        after_id = int(after) if after is not None else 0
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="invalid cursor") from error
+    if after_id < 0:
+        raise HTTPException(status_code=400, detail="invalid cursor")
+    run = store.get_run(run_id)
+    if run is None or run["agent_id"] != agent_id:
+        raise HTTPException(status_code=404, detail="run not found")
+    rows = store.list_events(run_id, after_id, limit)
+    events = [
+        {
+            "id": row["id"],
+            "runId": row["run_id"],
+            "type": row["event_type"],
+            "payload": json.loads(row["payload_json"]),
+            "createdAt": row["created_at"],
+        }
+        for row in rows
+    ]
+    return {
+        "runId": run_id,
+        "status": run["status"],
+        "events": events,
+        "nextCursor": str(rows[-1]["id"] if rows else after_id),
+    }
