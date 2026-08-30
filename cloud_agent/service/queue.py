@@ -64,14 +64,49 @@ class AgentQueue:
     def acknowledge(self, message_id: str) -> None:
         self.client.xack(self.stream, self.group, message_id)
 
-    def refresh_lease(self, consumer: str, message_id: str) -> None:
-        self.client.xclaim(
-            self.stream,
-            self.group,
-            consumer,
-            min_idle_time=0,
-            message_ids=[message_id],
-            justid=True,
+    def acknowledge_if_owned(self, consumer: str, message_id: str) -> bool:
+        script = """
+        local pending = redis.call(
+            'XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1
+        )
+        if #pending == 1 and pending[1][2] == ARGV[2] then
+            return redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+        end
+        return 0
+        """
+        return bool(
+            self.client.eval(
+                script,
+                1,
+                self.stream,
+                self.group,
+                consumer,
+                message_id,
+            )
+        )
+
+    def refresh_lease(self, consumer: str, message_id: str) -> bool:
+        script = """
+        local pending = redis.call(
+            'XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1
+        )
+        if #pending == 1 and pending[1][2] == ARGV[2] then
+            redis.call(
+                'XCLAIM', KEYS[1], ARGV[1], ARGV[2], 0, ARGV[3], 'JUSTID'
+            )
+            return 1
+        end
+        return 0
+        """
+        return bool(
+            self.client.eval(
+                script,
+                1,
+                self.stream,
+                self.group,
+                consumer,
+                message_id,
+            )
         )
 
     def close(self) -> None:

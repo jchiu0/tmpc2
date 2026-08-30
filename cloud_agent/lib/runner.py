@@ -35,6 +35,11 @@ class AgentRequest:
     output_branch: str | None = None
     mcp_url: str = DEFAULT_MCP_URL
     idempotency_key: str | None = None
+    history: tuple[dict[str, str], ...] = ()
+    prepared_commit_sha: str | None = None
+    prepared_parent_sha: str | None = None
+    prepared_branch: str | None = None
+    prepared_output: str | None = None
 
 
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
@@ -231,6 +236,7 @@ async def edit_with_grok(
     prompt: str,
     mcp_url: str,
     on_event: EventCallback | None = None,
+    history: tuple[dict[str, str], ...] = (),
 ) -> str:
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
@@ -249,6 +255,7 @@ file contents. Do not request shell commands. Finish only when the task is done.
 """.strip()
     messages = [
         {"role": "system", "content": instructions},
+        *history,
         {
             "role": "user",
             "content": f"Task:\n{prompt}\n\nReturn the first JSON action.",
@@ -321,6 +328,26 @@ async def run_agent(
             output_branch,
             request.prompt,
         )
+        if request.prepared_commit_sha and request.prepared_branch:
+            branch = request.prepared_branch
+            current_sha = github.get_ref(branch)
+            if current_sha != request.prepared_commit_sha:
+                if current_sha != request.prepared_parent_sha:
+                    raise AgentError(
+                        f"branch changed while recovering publication: {branch}"
+                    )
+                github.write_ref(
+                    branch,
+                    request.prepared_commit_sha,
+                    current_sha,
+                )
+            result = recovered_result(
+                request, starting_ref, branch, request.prepared_commit_sha
+            )
+            result["summary"] = (
+                request.prepared_output or result["summary"]
+            )
+            return result
         existing_output_sha = github.get_ref(branch)
         marker = (
             commit_marker(request.idempotency_key)
@@ -345,7 +372,11 @@ async def run_agent(
 
             await emit(on_event, "agent.status", {"status": "running"})
             summary = await edit_with_grok(
-                workspace, request.prompt, request.mcp_url, on_event
+                workspace,
+                request.prompt,
+                request.mcp_url,
+                on_event,
+                request.history,
             )
             if workspace_digest(workspace) == original_digest:
                 return {
@@ -362,6 +393,16 @@ async def run_agent(
             if marker:
                 message = f"{marker} {summary}"[:120]
             commit = github.create_commit(workspace, message, parent_sha)
+            await emit(
+                on_event,
+                "agent.publication_prepared",
+                {
+                    "branch": branch,
+                    "commit": commit,
+                    "parent": existing_output_sha,
+                    "output": summary,
+                },
+            )
             try:
                 github.write_ref(
                     branch,

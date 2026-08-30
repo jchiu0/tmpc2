@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+class AgentNotFoundError(RuntimeError):
+    pass
+
+
+class AgentBusyError(RuntimeError):
+    pass
+
+
+class StaleExecutionError(RuntimeError):
+    pass
+
+
 def now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -36,6 +48,7 @@ class AgentStore:
                     status TEXT NOT NULL,
                     repo_url TEXT NOT NULL,
                     starting_ref TEXT,
+                    working_branch TEXT,
                     work_on_current_branch INTEGER NOT NULL DEFAULT 0,
                     auto_create_pr INTEGER NOT NULL DEFAULT 1,
                     latest_run_id TEXT,
@@ -48,6 +61,7 @@ class AgentStore:
                     agent_id TEXT NOT NULL REFERENCES agents(agent_id),
                     status TEXT NOT NULL,
                     prompt TEXT NOT NULL,
+                    assistant_output TEXT,
                     starting_ref TEXT,
                     work_on_current_branch INTEGER NOT NULL DEFAULT 0,
                     output_branch TEXT,
@@ -55,6 +69,9 @@ class AgentStore:
                     result_json TEXT,
                     error TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
+                    prepared_commit_sha TEXT,
+                    prepared_parent_sha TEXT,
+                    prepared_branch TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -69,6 +86,9 @@ class AgentStore:
 
                 CREATE INDEX IF NOT EXISTS idx_runs_agent_id
                     ON runs(agent_id, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_per_agent
+                    ON runs(agent_id)
+                    WHERE status IN ('CREATING', 'RUNNING');
                 CREATE INDEX IF NOT EXISTS idx_run_events_run_id
                     ON run_events(run_id, id);
                 """
@@ -80,6 +100,7 @@ class AgentStore:
             additions = {
                 "name": "TEXT NOT NULL DEFAULT ''",
                 "starting_ref": "TEXT",
+                "working_branch": "TEXT",
                 "work_on_current_branch": "INTEGER NOT NULL DEFAULT 0",
                 "auto_create_pr": "INTEGER NOT NULL DEFAULT 1",
             }
@@ -97,6 +118,16 @@ class AgentStore:
                     "ALTER TABLE runs ADD COLUMN "
                     "attempt_count INTEGER NOT NULL DEFAULT 0"
                 )
+            for column in (
+                "assistant_output",
+                "prepared_commit_sha",
+                "prepared_parent_sha",
+                "prepared_branch",
+            ):
+                if column not in run_columns:
+                    connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {column} TEXT"
+                    )
 
     def create_agent_and_run(
         self,
@@ -106,6 +137,7 @@ class AgentStore:
         prompt: str,
         repo_url: str,
         starting_ref: str | None,
+        working_branch: str | None,
         work_on_current_branch: bool,
         auto_create_pr: bool,
         output_branch: str | None,
@@ -117,15 +149,16 @@ class AgentStore:
                 """
                 INSERT INTO agents (
                     agent_id, name, status, repo_url, starting_ref,
-                    work_on_current_branch, auto_create_pr, latest_run_id,
-                    created_at, updated_at
-                ) VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?)
+                    working_branch, work_on_current_branch, auto_create_pr,
+                    latest_run_id, created_at, updated_at
+                ) VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
                     name,
                     repo_url,
                     starting_ref,
+                    working_branch,
                     int(work_on_current_branch),
                     int(auto_create_pr),
                     run_id,
@@ -182,6 +215,116 @@ class AgentStore:
                 "updatedAt": timestamp,
             },
         }
+
+    def create_run(
+        self, agent_id: str, run_id: str, prompt: str, mcp_url: str
+    ) -> dict[str, Any]:
+        timestamp = now()
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                agent = connection.execute(
+                    "SELECT * FROM agents WHERE agent_id = ?", (agent_id,)
+                ).fetchone()
+                if agent is None:
+                    raise AgentNotFoundError(agent_id)
+                if agent["status"] == "ARCHIVED":
+                    raise AgentBusyError(agent_id)
+
+                previous = connection.execute(
+                    """
+                    SELECT result_json FROM runs
+                    WHERE agent_id = ? AND status = 'FINISHED'
+                    ORDER BY created_at DESC, run_id DESC LIMIT 1
+                    """,
+                    (agent_id,),
+                ).fetchone()
+                branch_exists = False
+                if previous and previous["result_json"]:
+                    branch_exists = bool(
+                        json.loads(previous["result_json"]).get("commit")
+                    )
+                if agent["work_on_current_branch"] or branch_exists:
+                    starting_ref = agent["working_branch"]
+                    work_on_current_branch = True
+                else:
+                    starting_ref = agent["starting_ref"]
+                    work_on_current_branch = False
+
+                connection.execute(
+                    """
+                    INSERT INTO runs (
+                        run_id, agent_id, status, prompt, starting_ref,
+                        work_on_current_branch, output_branch, mcp_url,
+                        created_at, updated_at
+                    ) VALUES (?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        agent_id,
+                        prompt,
+                        starting_ref,
+                        int(work_on_current_branch),
+                        agent["working_branch"],
+                        mcp_url,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE agents
+                    SET status = 'ACTIVE', latest_run_id = ?, updated_at = ?
+                    WHERE agent_id = ?
+                    """,
+                    (run_id, timestamp, agent_id),
+                )
+                self._insert_event(
+                    connection,
+                    run_id,
+                    "run.status",
+                    {"status": "CREATING"},
+                    timestamp,
+                )
+        except sqlite3.IntegrityError as error:
+            if "runs.agent_id" in str(error):
+                raise AgentBusyError(agent_id) from error
+            raise
+        return {
+            "run": {
+                "id": run_id,
+                "agentId": agent_id,
+                "status": "CREATING",
+                "createdAt": timestamp,
+                "updatedAt": timestamp,
+            }
+        }
+
+    def conversation_before(self, run_id: str) -> list[dict[str, str]]:
+        with self._connection() as connection:
+            current = connection.execute(
+                "SELECT agent_id, created_at FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if current is None:
+                return []
+            rows = connection.execute(
+                """
+                SELECT prompt, assistant_output
+                FROM runs
+                WHERE agent_id = ? AND status = 'FINISHED'
+                  AND assistant_output IS NOT NULL AND created_at < ?
+                ORDER BY created_at, run_id
+                """,
+                (current["agent_id"], current["created_at"]),
+            ).fetchall()
+        messages: list[dict[str, str]] = []
+        for row in rows:
+            messages.append({"role": "user", "content": row["prompt"]})
+            messages.append(
+                {"role": "assistant", "content": row["assistant_output"]}
+            )
+        return messages
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
@@ -249,21 +392,71 @@ class AgentStore:
             ).fetchone()
         return dict(claimed)
 
+    def is_current_epoch(self, run_id: str, epoch: int) -> bool:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE run_id = ? AND status = 'RUNNING'
+                  AND attempt_count = ?
+                """,
+                (run_id, epoch),
+            ).fetchone()
+        return row is not None
+
     def append_event(
-        self, run_id: str, event_type: str, payload: dict[str, Any]
+        self,
+        run_id: str,
+        epoch: int,
+        event_type: str,
+        payload: dict[str, Any],
     ) -> None:
         with self._connection() as connection:
+            self._require_epoch(connection, run_id, epoch)
             self._insert_event(connection, run_id, event_type, payload, now())
 
-    def finish(self, run_id: str, result: dict[str, Any]) -> None:
-        self._complete(run_id, "FINISHED", result, None)
+    def checkpoint_publication(
+        self,
+        run_id: str,
+        epoch: int,
+        branch: str,
+        commit_sha: str,
+        parent_sha: str | None,
+        assistant_output: str,
+    ) -> None:
+        with self._connection() as connection:
+            self._require_epoch(connection, run_id, epoch)
+            connection.execute(
+                """
+                UPDATE runs
+                SET prepared_branch = ?, prepared_commit_sha = ?,
+                    prepared_parent_sha = ?, assistant_output = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND attempt_count = ?
+                """,
+                (
+                    branch,
+                    commit_sha,
+                    parent_sha,
+                    assistant_output,
+                    now(),
+                    run_id,
+                    epoch,
+                ),
+            )
 
-    def fail(self, run_id: str, error: str) -> None:
-        self._complete(run_id, "ERROR", None, error)
+    def finish(
+        self, run_id: str, epoch: int, result: dict[str, Any]
+    ) -> None:
+        self._complete(run_id, epoch, "FINISHED", result, None)
+
+    def fail(self, run_id: str, epoch: int, error: str) -> None:
+        self._complete(run_id, epoch, "ERROR", None, error)
 
     def _complete(
         self,
         run_id: str,
+        epoch: int,
         status: str,
         result: dict[str, Any] | None,
         error: str | None,
@@ -274,33 +467,57 @@ class AgentStore:
             payload["result"] = result
         if error is not None:
             payload["error"] = error
+        output = result.get("summary") if result is not None else None
+        branch = result.get("branch") if result is not None else None
         with self._connection() as connection:
-            connection.execute(
+            self._require_epoch(connection, run_id, epoch)
+            cursor = connection.execute(
                 """
                 UPDATE runs
-                SET status = ?, result_json = ?, error = ?, updated_at = ?
-                WHERE run_id = ?
+                SET status = ?,
+                    assistant_output = COALESCE(?, assistant_output),
+                    result_json = ?, error = ?, updated_at = ?
+                WHERE run_id = ? AND attempt_count = ?
                 """,
                 (
                     status,
+                    output,
                     json.dumps(result) if result is not None else None,
                     error,
                     timestamp,
                     run_id,
+                    epoch,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise StaleExecutionError(run_id)
             connection.execute(
                 """
-                UPDATE agents SET status = 'IDLE', updated_at = ?
-                WHERE agent_id = (
-                    SELECT agent_id FROM runs WHERE run_id = ?
-                )
+                UPDATE agents
+                SET status = 'IDLE',
+                    working_branch = COALESCE(?, working_branch),
+                    updated_at = ?
+                WHERE latest_run_id = ?
                 """,
-                (timestamp, run_id),
+                (branch, timestamp, run_id),
             )
             self._insert_event(
                 connection, run_id, "run.status", payload, timestamp
             )
+
+    @staticmethod
+    def _require_epoch(
+        connection: sqlite3.Connection, run_id: str, epoch: int
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT 1 FROM runs
+            WHERE run_id = ? AND status = 'RUNNING' AND attempt_count = ?
+            """,
+            (run_id, epoch),
+        ).fetchone()
+        if row is None:
+            raise StaleExecutionError(run_id)
 
     @staticmethod
     def _insert_event(

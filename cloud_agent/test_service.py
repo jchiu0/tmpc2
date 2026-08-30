@@ -90,6 +90,7 @@ class ServiceTests(unittest.TestCase):
             prompt="Test prompt",
             repo_url="https://github.com/example/repo",
             starting_ref="main",
+            working_branch="cursor/test",
             work_on_current_branch=False,
             auto_create_pr=False,
             output_branch=None,
@@ -102,7 +103,9 @@ class ServiceTests(unittest.TestCase):
         retry = self.store.claim_execution("run-test")
         self.assertEqual(retry["attempt_count"], 2)
 
-        self.store.finish("run-test", {"status": "finished"})
+        self.store.finish(
+            "run-test", 2, {"status": "finished", "summary": "done"}
+        )
         self.assertIsNone(self.store.claim_execution("run-test"))
 
     def test_killed_worker_message_is_autoclaimed(self) -> None:

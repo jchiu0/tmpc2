@@ -13,7 +13,7 @@ from cloud_agent.lib import AgentRequest, run_agent
 
 from .config import load_settings
 from .queue import AgentQueue, QueueMessage
-from .storage import AgentStore
+from .storage import AgentStore, StaleExecutionError
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,7 @@ def process_message(
         message.run_id,
         run["attempt_count"],
     )
+    epoch = int(run["attempt_count"])
 
     request = AgentRequest(
         prompt=run["prompt"],
@@ -58,10 +59,32 @@ def process_message(
         output_branch=run["output_branch"],
         mcp_url=run["mcp_url"],
         idempotency_key=message.run_id,
+        history=tuple(store.conversation_before(message.run_id)),
+        prepared_commit_sha=run["prepared_commit_sha"],
+        prepared_parent_sha=run["prepared_parent_sha"],
+        prepared_branch=run["prepared_branch"],
+        prepared_output=run["assistant_output"],
     )
 
     def save_event(event_type: str, payload: dict) -> None:
-        store.append_event(message.run_id, event_type, payload)
+        if not queue.refresh_lease(consumer, message.message_id):
+            raise StaleExecutionError(message.run_id)
+        if event_type == "agent.publication_prepared":
+            store.checkpoint_publication(
+                message.run_id,
+                epoch,
+                payload["branch"],
+                payload["commit"],
+                payload.get("parent"),
+                payload["output"],
+            )
+            logger.info(
+                "publication_prepared run_id=%s commit=%s",
+                message.run_id,
+                payload["commit"],
+            )
+            return
+        store.append_event(message.run_id, epoch, event_type, payload)
         if event_type == "agent.status" and payload.get("status") == "running":
             logger.info("grok_started run_id=%s", message.run_id)
         elif event_type == "agent.response":
@@ -73,7 +96,18 @@ def process_message(
         interval = max(1.0, stale_after_ms / 3000)
         while not stop_heartbeat.wait(interval):
             try:
-                queue.refresh_lease(consumer, message.message_id)
+                if not store.is_current_epoch(message.run_id, epoch):
+                    logger.warning(
+                        "heartbeat_fenced run_id=%s epoch=%s",
+                        message.run_id,
+                        epoch,
+                    )
+                    return
+                if not queue.refresh_lease(consumer, message.message_id):
+                    logger.warning(
+                        "heartbeat_ownership_lost run_id=%s", message.run_id
+                    )
+                    return
             except RedisError:
                 return
 
@@ -91,17 +125,34 @@ def process_message(
             time.sleep(execution_delay)
         logger.info("execution_started run_id=%s", message.run_id)
         result = asyncio.run(run_agent(request, save_event))
+        if not queue.refresh_lease(consumer, message.message_id):
+            raise StaleExecutionError(message.run_id)
+    except StaleExecutionError:
+        logger.warning(
+            "execution_fenced run_id=%s epoch=%s", message.run_id, epoch
+        )
+        return
     except Exception as error:
-        store.fail(message.run_id, str(error))
+        try:
+            store.fail(message.run_id, epoch, str(error))
+        except StaleExecutionError:
+            logger.warning(
+                "failure_write_fenced run_id=%s epoch=%s",
+                message.run_id,
+                epoch,
+            )
+            return
         logger.exception("execution_failed run_id=%s", message.run_id)
     else:
-        store.finish(message.run_id, result)
+        store.finish(message.run_id, epoch, result)
         logger.info("execution_finished run_id=%s", message.run_id)
     finally:
         stop_heartbeat.set()
         heartbeat.join()
-    queue.acknowledge(message.message_id)
-    logger.info("message_acknowledged run_id=%s", message.run_id)
+    if queue.acknowledge_if_owned(consumer, message.message_id):
+        logger.info("message_acknowledged run_id=%s", message.run_id)
+    else:
+        logger.warning("acknowledgement_fenced run_id=%s", message.run_id)
 
 
 def run_worker(once: bool = False, execution_delay: float = 0) -> None:
