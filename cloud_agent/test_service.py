@@ -10,12 +10,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from cloud_agent.service import app as app_module
-from cloud_agent.service.queue import AgentQueue
+from cloud_agent.service.queue import AgentQueue, QueueMessage
 from cloud_agent.service.storage import (
     AgentBusyError,
     AgentStore,
     StaleExecutionError,
 )
+from cloud_agent.service.worker import process_message
 
 
 HOLD_PENDING_SCRIPT = """
@@ -185,6 +186,92 @@ class ServiceTests(unittest.TestCase):
                 {"role": "assistant", "content": "README created"},
             ],
         )
+
+    def test_crash_after_sqlite_finish_before_ack_recovers(self) -> None:
+        self.store.initialize()
+        self.store.create_agent_and_run(
+            agent_id="bc-finish-crash",
+            run_id="run-finish-crash",
+            name="Finish crash",
+            prompt="Create a README",
+            repo_url="https://github.com/example/repo",
+            starting_ref="main",
+            working_branch="cursor/finish-crash",
+            work_on_current_branch=False,
+            auto_create_pr=False,
+            output_branch="cursor/finish-crash",
+            mcp_url="http://127.0.0.1:8765/mcp",
+        )
+
+        class SimulatedCrash(BaseException):
+            pass
+
+        class CrashAfterFinishStore:
+            def __init__(self, store: AgentStore):
+                self.store = store
+
+            def __getattr__(self, name: str):
+                return getattr(self.store, name)
+
+            def finish(self, run_id: str, epoch: int, result: dict) -> None:
+                self.store.finish(run_id, epoch, result)
+                raise SimulatedCrash
+
+        class RecordingQueue:
+            def __init__(self):
+                self.acknowledgements = 0
+
+            def refresh_lease(self, consumer: str, message_id: str) -> bool:
+                return True
+
+            def acknowledge_if_owned(
+                self, consumer: str, message_id: str
+            ) -> bool:
+                self.acknowledgements += 1
+                return True
+
+        executions = 0
+
+        async def execute(request, on_event=None):
+            nonlocal executions
+            executions += 1
+            return {
+                "status": "finished",
+                "repo": request.repo,
+                "startingRef": request.starting_ref,
+                "workOnCurrentBranch": request.work_on_current_branch,
+                "branch": request.output_branch,
+                "commit": "abc123",
+                "summary": "README created",
+            }
+
+        message = QueueMessage("message-1", "run-finish-crash")
+        queue = RecordingQueue()
+        with self.assertRaises(SimulatedCrash):
+            process_message(
+                message,
+                CrashAfterFinishStore(self.store),
+                queue,
+                "worker-a",
+                stale_after_ms=60_000,
+                executor=execute,
+            )
+
+        stored = self.store.get_run(message.run_id)
+        self.assertEqual(stored["status"], "FINISHED")
+        self.assertEqual(queue.acknowledgements, 0)
+        self.assertEqual(executions, 1)
+
+        process_message(
+            message,
+            self.store,
+            queue,
+            "worker-b",
+            stale_after_ms=60_000,
+            executor=execute,
+        )
+        self.assertEqual(queue.acknowledgements, 1)
+        self.assertEqual(executions, 1)
 
     def test_killed_worker_message_is_autoclaimed(self) -> None:
         self.queue.initialize()

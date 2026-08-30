@@ -6,10 +6,12 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from redis.exceptions import RedisError
 
-from cloud_agent.lib import AgentRequest, run_agent
+from cloud_agent.lib import AgentRequest, EventCallback, run_agent
 
 from .config import load_settings
 from .queue import AgentQueue, QueueMessage
@@ -18,6 +20,9 @@ from .storage import AgentStore, StaleExecutionError
 
 logger = logging.getLogger(__name__)
 worker_identity = "unassigned"
+AgentExecutor = Callable[
+    [AgentRequest, EventCallback | None], Awaitable[dict[str, Any]]
+]
 
 
 class WorkerLogContext(logging.Filter):
@@ -38,11 +43,12 @@ def process_message(
     consumer: str,
     stale_after_ms: int,
     execution_delay: float = 0,
+    executor: AgentExecutor = run_agent,
 ) -> None:
     run = store.claim_execution(message.run_id)
     if run is None:
         logger.info("run_skipped run_id=%s reason=not_executable", message.run_id)
-        queue.acknowledge(message.message_id)
+        queue.acknowledge_if_owned(consumer, message.message_id)
         return
     logger.info(
         "run_claimed run_id=%s attempt=%s",
@@ -60,30 +66,11 @@ def process_message(
         mcp_url=run["mcp_url"],
         idempotency_key=message.run_id,
         history=tuple(store.conversation_before(message.run_id)),
-        prepared_commit_sha=run["prepared_commit_sha"],
-        prepared_parent_sha=run["prepared_parent_sha"],
-        prepared_branch=run["prepared_branch"],
-        prepared_output=run["assistant_output"],
     )
 
     def save_event(event_type: str, payload: dict) -> None:
         if not queue.refresh_lease(consumer, message.message_id):
             raise StaleExecutionError(message.run_id)
-        if event_type == "agent.publication_prepared":
-            store.checkpoint_publication(
-                message.run_id,
-                epoch,
-                payload["branch"],
-                payload["commit"],
-                payload.get("parent"),
-                payload["output"],
-            )
-            logger.info(
-                "publication_prepared run_id=%s commit=%s",
-                message.run_id,
-                payload["commit"],
-            )
-            return
         store.append_event(message.run_id, epoch, event_type, payload)
         if event_type == "agent.status" and payload.get("status") == "running":
             logger.info("grok_started run_id=%s", message.run_id)
@@ -124,7 +111,7 @@ def process_message(
             )
             time.sleep(execution_delay)
         logger.info("execution_started run_id=%s", message.run_id)
-        result = asyncio.run(run_agent(request, save_event))
+        result = asyncio.run(executor(request, save_event))
         if not queue.refresh_lease(consumer, message.message_id):
             raise StaleExecutionError(message.run_id)
     except StaleExecutionError:
