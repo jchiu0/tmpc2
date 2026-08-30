@@ -69,9 +69,6 @@ class AgentStore:
                     result_json TEXT,
                     error TEXT,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
-                    prepared_commit_sha TEXT,
-                    prepared_parent_sha TEXT,
-                    prepared_branch TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -118,12 +115,7 @@ class AgentStore:
                     "ALTER TABLE runs ADD COLUMN "
                     "attempt_count INTEGER NOT NULL DEFAULT 0"
                 )
-            for column in (
-                "assistant_output",
-                "prepared_commit_sha",
-                "prepared_parent_sha",
-                "prepared_branch",
-            ):
+            for column in ("assistant_output",):
                 if column not in run_columns:
                     connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {column} TEXT"
@@ -414,36 +406,6 @@ class AgentStore:
         with self._connection() as connection:
             self._require_epoch(connection, run_id, epoch)
             self._insert_event(connection, run_id, event_type, payload, now())
-
-    def checkpoint_publication(
-        self,
-        run_id: str,
-        epoch: int,
-        branch: str,
-        commit_sha: str,
-        parent_sha: str | None,
-        assistant_output: str,
-    ) -> None:
-        with self._connection() as connection:
-            self._require_epoch(connection, run_id, epoch)
-            connection.execute(
-                """
-                UPDATE runs
-                SET prepared_branch = ?, prepared_commit_sha = ?,
-                    prepared_parent_sha = ?, assistant_output = ?,
-                    updated_at = ?
-                WHERE run_id = ? AND attempt_count = ?
-                """,
-                (
-                    branch,
-                    commit_sha,
-                    parent_sha,
-                    assistant_output,
-                    now(),
-                    run_id,
-                    epoch,
-                ),
-            )
 
     def finish(
         self, run_id: str, epoch: int, result: dict[str, Any]

@@ -36,10 +36,6 @@ class AgentRequest:
     mcp_url: str = DEFAULT_MCP_URL
     idempotency_key: str | None = None
     history: tuple[dict[str, str], ...] = ()
-    prepared_commit_sha: str | None = None
-    prepared_parent_sha: str | None = None
-    prepared_branch: str | None = None
-    prepared_output: str | None = None
 
 
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
@@ -111,7 +107,11 @@ def commit_marker(idempotency_key: str) -> str:
 
 
 def recovered_result(
-    request: AgentRequest, starting_ref: str, branch: str, commit: str
+    request: AgentRequest,
+    starting_ref: str,
+    branch: str,
+    commit: str,
+    summary: str = "Recovered previously published run",
 ) -> dict[str, Any]:
     return {
         "status": "finished",
@@ -120,7 +120,7 @@ def recovered_result(
         "workOnCurrentBranch": request.work_on_current_branch,
         "branch": branch,
         "commit": commit,
-        "summary": "Recovered previously published run",
+        "summary": summary,
         "recovered": True,
     }
 
@@ -328,39 +328,24 @@ async def run_agent(
             output_branch,
             request.prompt,
         )
-        if request.prepared_commit_sha and request.prepared_branch:
-            branch = request.prepared_branch
-            current_sha = github.get_ref(branch)
-            if current_sha != request.prepared_commit_sha:
-                if current_sha != request.prepared_parent_sha:
-                    raise AgentError(
-                        f"branch changed while recovering publication: {branch}"
-                    )
-                github.write_ref(
-                    branch,
-                    request.prepared_commit_sha,
-                    current_sha,
-                )
-            result = recovered_result(
-                request, starting_ref, branch, request.prepared_commit_sha
-            )
-            result["summary"] = (
-                request.prepared_output or result["summary"]
-            )
-            return result
         existing_output_sha = github.get_ref(branch)
         marker = (
             commit_marker(request.idempotency_key)
             if request.idempotency_key
             else None
         )
-        if (
-            existing_output_sha
-            and marker
-            and github.commit_message(existing_output_sha).startswith(marker)
-        ):
+        existing_message = (
+            github.commit_message(existing_output_sha)
+            if existing_output_sha and marker
+            else ""
+        )
+        if existing_output_sha and marker and existing_message.startswith(marker):
             return recovered_result(
-                request, starting_ref, branch, existing_output_sha
+                request,
+                starting_ref,
+                branch,
+                existing_output_sha,
+                existing_message.removeprefix(marker).strip(),
             )
         if not request.work_on_current_branch and existing_output_sha:
             raise AgentError(f"output branch already exists: {branch}")
@@ -393,16 +378,6 @@ async def run_agent(
             if marker:
                 message = f"{marker} {summary}"[:120]
             commit = github.create_commit(workspace, message, parent_sha)
-            await emit(
-                on_event,
-                "agent.publication_prepared",
-                {
-                    "branch": branch,
-                    "commit": commit,
-                    "parent": existing_output_sha,
-                    "output": summary,
-                },
-            )
             try:
                 github.write_ref(
                     branch,
