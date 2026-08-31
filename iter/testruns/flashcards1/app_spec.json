@@ -1,0 +1,25 @@
+{
+  "resources": [
+    {
+      "name": "decks",
+      "fields": [
+        {"name": "title", "type": "text", "required": true},
+        {"name": "source_text", "type": "text", "required": false}
+      ]
+    },
+    {
+      "name": "cards",
+      "fields": [
+        {"name": "deck_id", "type": "integer", "required": true},
+        {"name": "question", "type": "text", "required": true},
+        {"name": "answer", "type": "text", "required": true}
+      ]
+    }
+  ],
+  "ai_actions": [
+    {
+      "name": "generate_flashcards",
+      "system_prompt": "You generate study flashcards for one anonymous student. The user message is a topic or pasted notes. Return ONLY valid JSON: an array of exactly eight objects. Each object must have string keys question and answer. Keep questions and answers concise, factual, and useful for studying. Do not include markdown, commentary, numbering, or extra keys."
+    }
+  ]
+}
