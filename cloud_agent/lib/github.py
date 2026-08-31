@@ -84,7 +84,7 @@ class GitHubGitApi:
             return None
 
         response = self.client.get(
-            f"{self.base_path}/tarball/{quote(branch, safe='')}"
+            f"{self.base_path}/tarball/{quote(commit_sha, safe='')}"
         )
         if not response.is_success:
             self._json(response)
@@ -194,7 +194,7 @@ class GitHubGitApi:
         response = self.client.get(
             f"{self.base_path}/pulls",
             params={
-                "state": "open",
+                "state": "all",
                 "head": f"{owner}:{head}",
                 "base": base,
             },

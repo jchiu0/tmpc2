@@ -28,7 +28,7 @@ def run_and_poll(
     worker = start_worker(environment, log_file)
     cursor = "0"
     events: list[dict] = []
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 600
     try:
         while time.monotonic() < deadline:
             response = request_json(

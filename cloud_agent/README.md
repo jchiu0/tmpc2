@@ -21,6 +21,8 @@ Set `GITHUB_TOKEN` or `GH_TOKEN` to a token with repository contents write
 access. The script uses GitHub APIs for both checkout and publishing. Restart
 the MCP server after changing its implementation.
 
+Install the app-builder's Python linter with `brew install ruff`.
+
 ## Run the asynchronous service
 
 Start Redis and the API from the project root:
@@ -144,6 +146,66 @@ To verify one agent chaining follow-up work onto a new output branch:
 ```bash
 cloud_agent/.venv/bin/python \
   cloud_agent/manual_tests/03_multiple_runs_multiple_branches.py
+```
+
+## Python state-machine agents
+
+Create a trusted workflow by sending `source` instead of `prompt`. The
+entrypoint must be a `StateMachine` subclass:
+
+```python
+from cloud_agent.workflow import StateMachine, activity, state
+
+@activity
+def verify_application(ctx, _input):
+    return ctx.run_command(["python", "-m", "pytest", "-q"])
+
+class Builder(StateMachine):
+    initial_state = "build"
+
+    @state
+    def build(self, ctx, event):
+        if event.type == "entered":
+            return ctx.run_llm("build-0", "Implement the application")
+        ctx.state["build"] = event.result["summary"]
+        return ctx.transition("evaluate")
+
+    @state
+    def evaluate(self, ctx, event):
+        if event.type == "entered":
+            return ctx.run_python("evaluate-0", "verify_application")
+        return ctx.complete("Application built")
+```
+
+Runs have an explicit `llm` or `python` type. `ctx.run_llm(...)` uses the
+existing model/tool loop; `ctx.run_python(...)` invokes a trusted source
+function decorated with `@activity` in a fresh repository checkout. Each keyed
+Run is a durable boundary. SQLite atomically stores the
+new state, state data, Run result, and next queue outbox entry. A replacement
+worker replays the current Run after a crash; its execution epoch fences stale
+workers. `ctx.run(key, result=...)` creates a Python checkpoint without
+calling the LLM. `ctx.run_command(...)` is a synchronous trusted-code helper.
+Pass `copy_context=False` to `ctx.run_llm(...)` when workflow Python supplies
+the required state and durable files explicitly instead of replaying all prior
+LLM transcripts.
+
+SQLite records `started_at` on the first worker claim and `finished_at` on
+completion. `GET /v1/agents/AGENT_ID/runs/RUN_ID` reports queue wait separately
+and defines `durationMs` as worker execution time, excluding queue wait.
+
+Poll `GET /v1/agents/AGENT_ID/state` for workflow state. When its status is
+`USER_INPUT`, send a response to `POST /v1/agents/AGENT_ID/input`.
+The bundled app-builder client runs `compileall` and Homebrew `ruff` immediately
+after each implementation Run. Lint failures return to the LLM with captured
+diagnostics before the separate pytest evaluation Run may complete.
+
+Run the real four-state app-builder checks:
+
+```bash
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/07_state_machine_happy_path.py
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/08_state_machine_crash_recovery.py
 ```
 
 Worker execution is idempotent by `runId`. Generated branch names are stable,

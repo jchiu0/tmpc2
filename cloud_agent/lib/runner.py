@@ -339,7 +339,7 @@ parallel, with at most {MAX_PARALLEL_ACTIONS} concurrent actions. Never put
 finish in an action array. Writable actions are always executed sequentially.
 """.rstrip()
     if include_title:
-        instructions += """
+        instructions += f"""
 
 The finish title must summarize the overall change in imperative mood, such as
 "Add request validation". Keep it specific, relevant to the completed work,
@@ -500,6 +500,14 @@ Return corrected valid JSON with escaped string content.
                         on_event,
                     )
 
+                async def execute_safely(
+                    action: dict[str, Any],
+                ) -> Any:
+                    try:
+                        return await execute_action(action)
+                    except (AgentError, OSError) as error:
+                        return {"error": str(error)}
+
                 def parallel_safe(action: dict[str, Any]) -> bool:
                     if action["action"] in {"list_files", "read_file"}:
                         return True
@@ -521,7 +529,7 @@ Return corrected valid JSON with escaped string content.
                         results.extend(
                             await asyncio.gather(
                                 *(
-                                    execute_action(action)
+                                    execute_safely(action)
                                     for action in current_actions[
                                         start : start
                                         + MAX_PARALLEL_ACTIONS
@@ -532,7 +540,7 @@ Return corrected valid JSON with escaped string content.
                 else:
                     results = []
                     for action in current_actions:
-                        results.append(await execute_action(action))
+                        results.append(await execute_safely(action))
 
             tool_result = f"""
 Action result:
@@ -656,10 +664,7 @@ async def run_agent(
             if not request.auto_create_pr:
                 return result
             if branch == starting_ref:
-                raise AgentError(
-                    "autoCreatePR requires an output branch different "
-                    "from startingRef"
-                )
+                return result
             result["pullRequest"] = github.ensure_pull_request(
                 head=branch,
                 base=starting_ref,

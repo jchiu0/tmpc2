@@ -2,21 +2,34 @@ import hashlib
 import json
 import uuid
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 from redis.exceptions import RedisError
 
 from cloud_agent.lib.runner import generated_branch
 
 from .config import load_settings
 from .queue import AgentQueue
-from .storage import AgentBusyError, AgentNotFoundError, AgentStore
+from .storage import (
+    AgentBusyError,
+    AgentNotFoundError,
+    AgentStore,
+    SourceAgentRunError,
+    WorkflowNotWaitingError,
+)
 
 
 class Prompt(BaseModel):
     text: str = Field(min_length=1)
+
+
+class Source(BaseModel):
+    language: Literal["python"]
+    code: str = Field(min_length=1, max_length=200_000)
+    entrypoint: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class Repository(BaseModel):
@@ -33,15 +46,22 @@ class CustomSubagent(BaseModel):
 
 
 class CreateAgentRequest(BaseModel):
-    prompt: Prompt
+    prompt: Prompt | None = None
+    source: Source | None = None
     repos: Annotated[list[Repository], Field(min_length=1, max_length=1)]
     name: str | None = Field(default=None, max_length=100)
     workOnCurrentBranch: bool = False
-    autoCreatePR: bool = True
+    autoCreatePR: bool | None = None
     outputBranch: str | None = None
     customSubagents: list[CustomSubagent] = Field(
         default_factory=list, max_length=20
     )
+
+    @model_validator(mode="after")
+    def validate_input(self) -> "CreateAgentRequest":
+        if (self.prompt is None) == (self.source is None):
+            raise ValueError("exactly one of prompt or source is required")
+        return self
 
 
 class AgentEnvironment(BaseModel):
@@ -65,9 +85,18 @@ class AgentResponse(BaseModel):
 class RunResponse(BaseModel):
     id: str
     agentId: str
+    type: Literal["llm", "python"]
     status: str
     createdAt: str
     updatedAt: str
+
+
+class RunDetailResponse(RunResponse):
+    workflowKey: str | None
+    startedAt: str | None
+    finishedAt: str | None
+    queueDurationMs: int | None
+    durationMs: int | None
 
 
 class CreateAgentResponse(BaseModel):
@@ -78,6 +107,10 @@ class CreateAgentResponse(BaseModel):
 class CreateRunRequest(BaseModel):
     prompt: Prompt
     outputBranch: str | None = None
+
+
+class WorkflowInputRequest(BaseModel):
+    response: str = Field(min_length=1)
 
 
 class CreateRunResponse(BaseModel):
@@ -134,35 +167,58 @@ def create_agent(request: CreateAgentRequest) -> dict:
     agent_id = f"bc-{uuid.uuid4()}"
     run_id = f"run-{uuid.uuid4()}"
     repository = request.repos[0]
+    source = request.source
+    prompt_text = request.prompt.text if request.prompt is not None else None
+    auto_create_pr = (
+        request.autoCreatePR
+        if request.autoCreatePR is not None
+        else source is None
+    )
     if request.workOnCurrentBranch:
         working_branch = repository.startingRef
         output_branch = repository.startingRef
     else:
         suffix = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()[:6]
         working_branch = request.outputBranch or generated_branch(
-            request.prompt.text, suffix
+            prompt_text or f"workflow-{source.entrypoint}", suffix
         )
         output_branch = working_branch
-    created = store.create_agent_and_run(
-        agent_id=agent_id,
-        run_id=run_id,
-        name=request.name or request.prompt.text[:100],
-        prompt=request.prompt.text,
-        repo_url=str(repository.url),
-        starting_ref=repository.startingRef,
-        working_branch=working_branch,
-        work_on_current_branch=request.workOnCurrentBranch,
-        auto_create_pr=request.autoCreatePR,
-        output_branch=output_branch,
-        mcp_url=settings.mcp_url,
-        custom_subagents=tuple(
-            subagent.model_dump() for subagent in request.customSubagents
-        ),
-    )
+    if source is not None:
+        created = store.create_source_agent_and_run(
+            agent_id=agent_id,
+            run_id=run_id,
+            name=request.name or source.entrypoint,
+            source_code=source.code,
+            source_hash=hashlib.sha256(source.code.encode("utf-8")).hexdigest(),
+            source_entrypoint=source.entrypoint,
+            repo_url=str(repository.url),
+            starting_ref=repository.startingRef,
+            working_branch=working_branch,
+            auto_create_pr=auto_create_pr,
+            mcp_url=settings.mcp_url,
+        )
+    else:
+        created = store.create_agent_and_run(
+            agent_id=agent_id,
+            run_id=run_id,
+            name=request.name or prompt_text[:100],
+            prompt=prompt_text,
+            repo_url=str(repository.url),
+            starting_ref=repository.startingRef,
+            working_branch=working_branch,
+            work_on_current_branch=request.workOnCurrentBranch,
+            auto_create_pr=auto_create_pr,
+            output_branch=output_branch,
+            mcp_url=settings.mcp_url,
+            custom_subagents=tuple(
+                subagent.model_dump() for subagent in request.customSubagents
+            ),
+        )
 
     # TODO: Replace this SQLite/Redis dual write with a transactional outbox.
     try:
         queue.publish(run_id)
+        store.mark_outbox_run_delivered(run_id)
     except RedisError as error:
         raise HTTPException(
             status_code=503,
@@ -198,16 +254,135 @@ def create_run(
             status_code=409,
             detail={"code": "agent_busy", "message": "agent has an active run"},
         ) from error
+    except SourceAgentRunError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_autonomous",
+                "message": "source agents do not accept follow-up runs",
+            },
+        ) from error
 
     # TODO: Replace this SQLite/Redis dual write with a transactional outbox.
     try:
         queue.publish(run_id)
+        store.mark_outbox_run_delivered(run_id)
     except RedisError as error:
         raise HTTPException(
             status_code=503,
             detail=f"run {run_id} was saved but could not be queued",
         ) from error
     return created
+
+
+@app.get(
+    "/v1/agents/{agent_id}/state",
+)
+def get_agent_state(agent_id: str) -> dict[str, Any]:
+    agent = store.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if agent["agent_kind"] != "source":
+        raise HTTPException(
+            status_code=409, detail="agent does not have workflow state"
+        )
+    return {
+        "agentId": agent_id,
+        "status": agent["workflow_status"],
+        "state": agent["workflow_state"],
+        "stateData": json.loads(agent["workflow_state_json"]),
+        "result": agent["workflow_result"],
+        "version": agent["workflow_version"],
+        "latestRunId": agent["latest_run_id"],
+        "userInput": (
+            {
+                "key": agent["workflow_input_key"],
+                "prompt": agent["workflow_input_prompt"],
+            }
+            if agent["workflow_status"] == "USER_INPUT"
+            else None
+        ),
+    }
+
+
+@app.post("/v1/agents/{agent_id}/input", status_code=202)
+def provide_workflow_input(
+    agent_id: str, request: WorkflowInputRequest
+) -> dict[str, Any]:
+    run_id = f"run-{uuid.uuid4()}"
+    try:
+        created = store.resume_workflow_with_input(
+            agent_id, run_id, request.response
+        )
+    except AgentNotFoundError as error:
+        raise HTTPException(status_code=404, detail="agent not found") from error
+    except WorkflowNotWaitingError as error:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "workflow_not_waiting",
+                "message": "workflow is not waiting for user input",
+            },
+        ) from error
+    try:
+        queue.publish(run_id)
+        store.mark_outbox_run_delivered(run_id)
+    except RedisError as error:
+        raise HTTPException(
+            status_code=503,
+            detail="workflow input persisted but queue is unavailable",
+        ) from error
+    return {
+        "agent": {
+            "id": agent_id,
+            "status": "ACTIVE",
+            "latestRunId": run_id,
+        },
+        "run": {
+            "id": created["run_id"],
+            "agentId": agent_id,
+            "type": created["run_kind"],
+            "status": created["status"],
+            "createdAt": created["created_at"],
+            "updatedAt": created["updated_at"],
+        },
+    }
+
+
+def elapsed_ms(start: str | None, end: str | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return round(
+        (
+            datetime.fromisoformat(end) - datetime.fromisoformat(start)
+        ).total_seconds()
+        * 1000
+    )
+
+
+@app.get(
+    "/v1/agents/{agent_id}/runs/{run_id}",
+    response_model=RunDetailResponse,
+)
+def get_run(agent_id: str, run_id: str) -> dict[str, Any]:
+    run = store.get_run(run_id)
+    if run is None or run["agent_id"] != agent_id:
+        raise HTTPException(status_code=404, detail="run not found")
+    return {
+        "id": run_id,
+        "agentId": agent_id,
+        "type": run["run_kind"],
+        "status": run["status"],
+        "workflowKey": run["workflow_key"],
+        "createdAt": run["created_at"],
+        "updatedAt": run["updated_at"],
+        "startedAt": run["started_at"],
+        "finishedAt": run["finished_at"],
+        "queueDurationMs": elapsed_ms(
+            run["created_at"], run["started_at"]
+        ),
+        "durationMs": elapsed_ms(run["started_at"], run["finished_at"]),
+    }
 
 
 @app.get(

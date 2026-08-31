@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -17,6 +18,8 @@ from cloud_agent.lib import (
     SubagentDefinition,
     run_agent,
 )
+from cloud_agent.python_runner import run_python_activity
+from cloud_agent.workflow_runtime import WorkflowInvocation, invoke_workflow
 
 from .config import load_settings
 from .queue import AgentQueue, QueueMessage
@@ -28,6 +31,69 @@ worker_identity = "unassigned"
 AgentExecutor = Callable[
     [AgentRequest, EventCallback | None], Awaitable[dict[str, Any]]
 ]
+MAX_INTERNAL_TRANSITIONS = 20
+
+
+def resolve_workflow_command(
+    run: dict[str, Any],
+    state_name: str | None,
+    state_data: dict[str, Any],
+    event: dict[str, Any],
+) -> WorkflowInvocation:
+    for _ in range(MAX_INTERNAL_TRANSITIONS):
+        invocation = invoke_workflow(
+            source=run["source_code"],
+            source_hash=run["source_hash"],
+            entrypoint=run["source_entrypoint"],
+            state_name=state_name,
+            state_data=state_data,
+            event=event,
+        )
+        if invocation.command["type"] != "transition":
+            return invocation
+        state_name = invocation.command["arguments"]["state"]
+        state_data = invocation.state_data
+        event = {"type": "entered", "payload": {}}
+    raise RuntimeError("workflow exceeded internal transition limit")
+
+
+def flush_outbox(store: AgentStore, queue: AgentQueue) -> None:
+    publish = getattr(queue, "publish", None)
+    if publish is None:
+        return
+    for item in store.pending_outbox():
+        publish(item["run_id"])
+        store.mark_outbox_delivered(item["id"])
+
+
+def build_agent_request(
+    run: dict[str, Any], store: AgentStore, run_id: str
+) -> AgentRequest:
+    return AgentRequest(
+        prompt=run["prompt"],
+        repo=run["repo_url"],
+        starting_ref=run["starting_ref"],
+        work_on_current_branch=bool(run["work_on_current_branch"]),
+        output_branch=run["output_branch"],
+        auto_create_pr=bool(run["auto_create_pr"]),
+        mcp_url=run["mcp_url"],
+        idempotency_key=run_id,
+        history=(
+            tuple(store.conversation_before(run_id))
+            if run["copy_context"]
+            else ()
+        ),
+        subagents=tuple(
+            SubagentDefinition(
+                name=subagent["name"],
+                description=subagent["description"],
+                prompt=subagent["prompt"],
+                model=subagent["model"],
+                readonly=bool(subagent["readonly"]),
+            )
+            for subagent in store.get_subagents(run["agent_id"])
+        ),
+    )
 
 
 class WorkerLogContext(logging.Filter):
@@ -61,28 +127,6 @@ def process_message(
         run["attempt_count"],
     )
     epoch = int(run["attempt_count"])
-
-    request = AgentRequest(
-        prompt=run["prompt"],
-        repo=run["repo_url"],
-        starting_ref=run["starting_ref"],
-        work_on_current_branch=bool(run["work_on_current_branch"]),
-        output_branch=run["output_branch"],
-        auto_create_pr=bool(run["auto_create_pr"]),
-        mcp_url=run["mcp_url"],
-        idempotency_key=message.run_id,
-        history=tuple(store.conversation_before(message.run_id)),
-        subagents=tuple(
-            SubagentDefinition(
-                name=subagent["name"],
-                description=subagent["description"],
-                prompt=subagent["prompt"],
-                model=subagent["model"],
-                readonly=bool(subagent["readonly"]),
-            )
-            for subagent in store.get_subagents(run["agent_id"])
-        ),
-    )
 
     def save_event(event_type: str, payload: dict) -> None:
         if not queue.refresh_lease(consumer, message.message_id):
@@ -125,6 +169,7 @@ def process_message(
     # cannot delay the lease heartbeat through GIL contention.
     heartbeat = threading.Thread(target=refresh_lease, daemon=True)
     heartbeat.start()
+    workflow_finished = False
     try:
         if execution_delay:
             logger.info(
@@ -134,7 +179,99 @@ def process_message(
             )
             time.sleep(execution_delay)
         logger.info("execution_started run_id=%s", message.run_id)
-        result = asyncio.run(executor(request, save_event))
+        if run["agent_kind"] == "source":
+            if run["workflow_key"] is None:
+                invocation = resolve_workflow_command(
+                    run,
+                    run["agent_workflow_state"],
+                    json.loads(run["agent_workflow_state_json"]),
+                    {"type": "entered", "payload": {}},
+                )
+                command = invocation.command
+                result = {
+                    "status": "finished",
+                    "summary": "Workflow orchestration completed",
+                    "branch": run["output_branch"],
+                    "commit": None,
+                }
+                store.finish_workflow_run(
+                    message.run_id,
+                    epoch,
+                    result,
+                    state_name=invocation.state_name,
+                    state_data=invocation.state_data,
+                    command=command,
+                    next_run_id=(
+                        f"run-{uuid.uuid4()}"
+                        if command["type"] == "run"
+                        else None
+                    ),
+                )
+                workflow_finished = True
+            if not workflow_finished:
+                if run["run_kind"] == "llm":
+                    result = asyncio.run(
+                        executor(
+                            build_agent_request(run, store, message.run_id),
+                            save_event,
+                        )
+                    )
+                elif run["python_activity"]:
+                    result = run_python_activity(run, save_event)
+                else:
+                    result = {
+                        "status": "finished",
+                        "repo": run["repo_url"],
+                        "startingRef": run["starting_ref"],
+                        "workOnCurrentBranch": bool(
+                            run["work_on_current_branch"]
+                        ),
+                        "branch": run["output_branch"],
+                        "commit": None,
+                        "summary": (
+                            run["checkpoint_result"]
+                            or "Workflow state checkpointed"
+                        ),
+                    }
+                workflow_event = (
+                    {
+                        "type": run["workflow_event_type"],
+                        "payload": json.loads(run["workflow_event_json"]),
+                    }
+                    if run["workflow_event_type"]
+                    else {
+                        "type": "run_completed",
+                        "payload": {"result": result},
+                    }
+                )
+                invocation = resolve_workflow_command(
+                    run,
+                    run["workflow_state"],
+                    json.loads(run["workflow_state_json"]),
+                    workflow_event,
+                )
+                next_run_id = (
+                    f"run-{uuid.uuid4()}"
+                    if invocation.command["type"] == "run"
+                    else None
+                )
+                store.finish_workflow_run(
+                    message.run_id,
+                    epoch,
+                    result,
+                    state_name=invocation.state_name,
+                    state_data=invocation.state_data,
+                    command=invocation.command,
+                    next_run_id=next_run_id,
+                )
+                workflow_finished = True
+        else:
+            result = asyncio.run(
+                executor(
+                    build_agent_request(run, store, message.run_id),
+                    save_event,
+                )
+            )
         if not queue.refresh_lease(consumer, message.message_id):
             raise StaleExecutionError(message.run_id)
     except StaleExecutionError:
@@ -159,7 +296,9 @@ def process_message(
             return
         logger.exception("execution_failed run_id=%s", message.run_id)
     else:
-        store.finish(message.run_id, epoch, result)
+        if not workflow_finished:
+            store.finish(message.run_id, epoch, result)
+        flush_outbox(store, queue)
         logger.info("execution_finished run_id=%s", message.run_id)
     finally:
         stop_heartbeat.set()
@@ -186,6 +325,7 @@ def run_worker(once: bool = False, execution_delay: float = 0) -> None:
     claim_stale_next = False
     try:
         while True:
+            flush_outbox(store, queue)
             if claim_stale_next:
                 stale = queue.claim_stale(consumer, settings.stale_after_ms)
                 message = stale[0] if stale else None
