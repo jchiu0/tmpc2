@@ -1,0 +1,26 @@
+[
+  {
+    "question": "Who is this for in v1, and is login required? (single anonymous user / multiple users with accounts / shared lists between users)",
+    "answer": "Open assumption"
+  },
+  {
+    "question": "Which todo behaviors are required for v1? (add, edit, complete/uncomplete, delete only / also due dates and priority / also tags, filters, search, and sorting)",
+    "answer": "Open assumption"
+  },
+  {
+    "question": "How should tasks be organized? (one flat list / multiple named lists or projects / lists plus optional subtasks)",
+    "answer": "Open assumption"
+  },
+  {
+    "question": "What visual and layout expectations do you have? (minimal/clean desktop page / mobile-first responsive / denser dashboard look; any must-have empty states, colors, or dark mode?)",
+    "answer": "Open assumption"
+  },
+  {
+    "question": "What accessibility bar should we hit? (usable with keyboard only / keyboard plus screen-reader labels / explicit WCAG 2.1 AA)",
+    "answer": "Open assumption"
+  },
+  {
+    "question": "What counts as done for this v1? (working persisted CRUD UI / plus validation and clear empty/error states / plus basic automated tests)",
+    "answer": "Open assumption"
+  }
+]

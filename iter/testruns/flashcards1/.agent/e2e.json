@@ -1,0 +1,5 @@
+{
+  "status": "passed",
+  "returncode": 0,
+  "output": "\n> constrained-prototype@0.0.0 test:e2e\n> playwright test\n\n[WebServer] INFO:     Started server process [38514]\n[WebServer] INFO:     Waiting for application startup.\n[WebServer] INFO:     Application startup complete.\n[WebServer] INFO:     Uvicorn running on http://127.0.0.1:8011 (Press CTRL+C to quit)\n\nRunning 1 test using 1 worker\n\n(node:39456) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.\n(Use `node --trace-warnings ...` to show where the warning was created)\n  \u2713  1 e2e/app.spec.js:3:1 \u203a creates, persists, and deletes an item (692ms)\n\n  1 passed (5.4s)\n"
+}

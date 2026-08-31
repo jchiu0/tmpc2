@@ -1,0 +1,12 @@
+{
+  "resources": [
+    {
+      "name": "todos",
+      "fields": [
+        {"name": "title", "type": "text", "required": true},
+        {"name": "notes", "type": "text", "required": false},
+        {"name": "completed", "type": "boolean", "required": false}
+      ]
+    }
+  ]
+}

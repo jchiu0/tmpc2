@@ -1,0 +1,21 @@
+- Verdict: PARTIAL
+- Requirements checklist
+  - [x] Anonymous single-user app with no login/sharing (`app_spec.json` has no user/auth; runtime is open CRUD)
+  - [x] Persist decks/cards in SQLite via wrapper APIs (`decks` + `cards` in spec; E2E reload after create stayed visible)
+  - [x] Typed topic or pasted notes in one field (E2E filled `primary-input`; README documents topic/notes)
+  - [x] Named AI action `generate_flashcards` asking for exactly eight `{question, answer}` objects
+  - [x] Playwright harness passed (observed: 1/1, 692ms, create → reload persist → delete)
+  - [~] Generate eight cards, then flip/review/edit/delete cards — declared in spec/README, **not** exercised by E2E
+  - [~] Done path generate → save → review → edit → delete a **deck** end to end — only create/persist/delete of a generic item was observed
+  - [~] Loading, empty, and error states — claimed in plan/README; not in E2E; `App.jsx` / `styles.css` were not in the supplied snapshot
+  - [~] Keyboard navigation and screen-reader labels — not verified at runtime
+  - [ ] Approved save model: unsaved 8-card working set, then one Save writes deck + cards — README instead saves a deck immediately, then generate, then “saving again” writes cards onto a **new** deck
+- Issues
+  - Observed E2E only covers generic item CRUD (`primary-input` → `create-submit` → `resource-item` → `delete-button`). 692ms is consistent with `POST /api/decks`, not AI generation, flip, edit, or card delete.
+  - README flow conflicts with the approved plan: Save creates an empty/title-only deck first (to satisfy the harness), and a later save after generate creates another deck rather than attaching eight cards to an unsaved working set.
+  - Static review could not confirm UI/a11y/visual states: `frontend/src/App.jsx` and `styles.css` were missing from the file dump (E2E implies some UI exists).
+  - `frontend/index.html` title is still “Prototype”, not the study app.
+- Recommended next iteration
+  - Keep harness testids, but implement the planned path: Generate → hold eight cards in memory → Save creates one deck and eight cards; discard/regenerate must not touch stored decks.
+  - After save, open review with Flip / Previous / Next / Edit / Delete card (confirm) / Delete deck (cards then deck), all with accessible names, `aria-live` loading/errors, and a true empty state.
+  - Add (or rely on harness) coverage that eight cards appear after generate and that a saved deck survives reload — the current passing test does not prove the study product.

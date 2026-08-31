@@ -1,0 +1,7 @@
+[
+  "One anonymous student; no login or sharing.",
+  "Generate eight concise question-and-answer flashcards, then let the student flip, review, edit, and delete cards.",
+  "Accept either a typed topic or pasted notes and persist saved decks and cards across visits.",
+  "Use a clean, colorful, mobile-first interface with clear loading, empty, and error states.",
+  "Done means a student can generate, save, review, edit, and delete a deck end to end; support keyboard navigation and screen-reader labels, and require backend plus Playwright E2E tests to pass."
+]

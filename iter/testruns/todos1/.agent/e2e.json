@@ -1,0 +1,6 @@
+{
+  "status": "passed",
+  "returncode": 0,
+  "test": "creates, persists, and deletes an item",
+  "duration_seconds": 5.9
+}

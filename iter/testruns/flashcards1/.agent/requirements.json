@@ -1,0 +1,22 @@
+[
+  {
+    "question": "Who is the primary user of this studying app? (e.g. high-school exam cramming, college students with lectures/textbooks, language learners, professionals/certifications, or general self-learners) Is v1 single-user only or multi-user with accounts?",
+    "answer": "One anonymous student; no login or sharing."
+  },
+  {
+    "question": "What is the main thing the AI should do to help someone study? Pick a primary and any must-have extras: A) chat tutor that explains and quizzes B) generate flashcards with review/spaced repetition C) upload notes \u2192 auto quizzes/practice tests D) generate a study plan/schedule E) something else (describe the happy path in one sentence).",
+    "answer": "Generate eight concise question-and-answer flashcards, then let the student flip, review, edit, and delete cards."
+  },
+  {
+    "question": "How do users provide what they want to study? (upload PDF/text notes, paste content, type a topic/question only, or a mix) Should the app remember past materials and sessions across visits?",
+    "answer": "Accept either a typed topic or pasted notes and persist saved decks and cards across visits."
+  },
+  {
+    "question": "What should it look like? (chat-first, flashcard deck, dashboard with progress cards, or split view of notes + AI) Any visual must-haves: dark mode, mobile-first, dense vs spacious, or a specific reference app?",
+    "answer": "Use a clean, colorful, mobile-first interface with clear loading, empty, and error states."
+  },
+  {
+    "question": "What does 'done' mean for v1 (one concrete scenario we must nail end-to-end)? Any accessibility requirements (keyboard-only use, screen reader support, high contrast, captions for spoken AI)?",
+    "answer": "Done means a student can generate, save, review, edit, and delete a deck end to end; support keyboard navigation and screen-reader labels, and require backend plus Playwright E2E tests to pass."
+  }
+]

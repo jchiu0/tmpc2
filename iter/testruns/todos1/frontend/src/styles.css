@@ -1,0 +1,270 @@
+:root {
+  --bg: #eef1f6;
+  --card: #ffffff;
+  --text: #1c2430;
+  --muted: #667085;
+  --line: #e4e7ec;
+  --accent: #3559e0;
+  --accent-hover: #2b48c4;
+  --danger: #c23b3b;
+  --shadow: 0 12px 40px rgba(28, 36, 48, 0.08);
+  --radius: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--text);
+  background: radial-gradient(circle at top, #f8fafc, var(--bg));
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #c9d2e3;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid rgba(53, 89, 224, 0.35);
+  outline-offset: 1px;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.page {
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  padding: 24px 16px 48px;
+}
+
+.card {
+  width: min(640px, 100%);
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 28px 24px 24px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 2rem;
+  letter-spacing: -0.03em;
+}
+
+.subtitle {
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.add-form {
+  display: grid;
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.field label {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.add-row {
+  display: flex;
+  gap: 8px;
+}
+
+.add-form input,
+.add-form textarea,
+.edit-input,
+.edit-notes {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+
+.add-form input {
+  min-height: 44px;
+}
+
+.add-form textarea,
+.edit-notes {
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.4;
+}
+
+.add-form button[type="submit"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.add-form button[type="submit"]:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.error {
+  margin: 12px 0 0;
+  color: var(--danger);
+}
+
+.status,
+.empty {
+  margin: 28px 0 8px;
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--muted);
+  background: #f8fafc;
+  border-radius: 12px;
+}
+
+.list {
+  list-style: none;
+  margin: 20px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--line);
+}
+
+.item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px 10px;
+  align-items: start;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.body {
+  min-width: 0;
+  padding-top: 10px;
+}
+
+.title-text {
+  margin: 0;
+  word-break: break-word;
+}
+
+.notes-text {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.item.is-completed .title-text {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.edit-fields {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.edit-input {
+  min-height: 44px;
+  border-color: #c7d2fe;
+  background: #f8faff;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.actions button {
+  min-height: 36px;
+}
+
+.danger {
+  color: var(--danger);
+}
+
+@media (max-width: 520px) {
+  .card {
+    padding: 22px 16px 16px;
+  }
+
+  .add-row {
+    flex-direction: column;
+  }
+
+  .item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+}
