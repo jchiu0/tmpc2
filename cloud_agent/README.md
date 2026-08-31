@@ -92,18 +92,58 @@ continue polling until `status` is terminal.
 Run the real two-run polling and conversation-continuation check:
 
 ```bash
-cloud_agent/.venv/bin/python cloud_agent/manual_tests/multiple_runs.py
+cloud_agent/.venv/bin/python cloud_agent/manual_tests/02_multiple_runs.py
 ```
 
 This starts an isolated API and one-shot workers, uses a unique Redis stream
 and database, and verifies that the second run reuses both the first run's
 conversation result and Git branch.
 
+Agent creation may include up to 20 custom foreground subagents:
+
+```json
+"customSubagents": [{
+  "name": "reviewer",
+  "description": "Reviews repository changes",
+  "prompt": "Inspect the delegated task carefully and report issues.",
+  "model": "inherit",
+  "readonly": true
+}]
+```
+
+The parent invokes one with a `delegate` action. Each child gets a clean model
+context and the same temporary workspace, while only its final result returns
+to the parent context. Children never publish Git. If the worker dies during
+delegation, Redis retries the complete parent run from its Git starting point;
+there is no separate subagent recovery.
+
+Run the real delegation and parent-owned Git publication check:
+
+```bash
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/04_subagent_delegation.py
+```
+
+To verify bounded parallelism with two readonly analyses followed by one
+writable implementation:
+
+```bash
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/05_parallel_subagent_delegation.py
+```
+
+To verify `autoCreatePR` with a generated LeetCode solution:
+
+```bash
+cloud_agent/.venv/bin/python \
+  cloud_agent/manual_tests/06_auto_create_pr.py
+```
+
 To verify one agent chaining follow-up work onto a new output branch:
 
 ```bash
 cloud_agent/.venv/bin/python \
-  cloud_agent/manual_tests/multiple_runs_multiple_branches.py
+  cloud_agent/manual_tests/03_multiple_runs_multiple_branches.py
 ```
 
 Worker execution is idempotent by `runId`. Generated branch names are stable,

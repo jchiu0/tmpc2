@@ -183,6 +183,44 @@ class GitHubGitApi:
             )
         self._json(response)
 
+    def ensure_pull_request(
+        self,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> dict[str, Any]:
+        owner = self.repository.split("/", 1)[0]
+        response = self.client.get(
+            f"{self.base_path}/pulls",
+            params={
+                "state": "open",
+                "head": f"{owner}:{head}",
+                "base": base,
+            },
+        )
+        if not response.is_success:
+            self._json(response)
+        existing = response.json()
+        if existing:
+            pull_request = existing[0]
+        else:
+            pull_request = self._json(
+                self.client.post(
+                    f"{self.base_path}/pulls",
+                    json={
+                        "title": title[:256],
+                        "head": head,
+                        "base": base,
+                        "body": body,
+                    },
+                )
+            )
+        return {
+            "number": pull_request["number"],
+            "url": pull_request["html_url"],
+        }
+
     @staticmethod
     def _workspace_files(workspace: Path) -> list[Path]:
         return sorted(

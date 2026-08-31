@@ -1,7 +1,7 @@
 # Manual Worker Crash-Recovery Test
 
 This runbook reproduces the two-worker crash test captured in
-`cloud_agent/logs/manual_crash_recovery.log`.
+`cloud_agent/logs/01_manual_crash_recovery.log`.
 
 The test starts Worker A with a deterministic delay after it claims a run,
 kills it, and starts Worker B. Worker B should auto-claim the pending Redis
@@ -53,7 +53,7 @@ Use only these dedicated test names:
 rm -f "$CLOUD_AGENT_DB"
 redis-cli DEL "$AGENT_STREAM"
 mkdir -p cloud_agent/logs
-: > cloud_agent/logs/manual_crash_recovery.log
+: > cloud_agent/logs/01_manual_crash_recovery.log
 ```
 
 Choose a new branch so a previous test publication cannot be mistaken for the
@@ -84,7 +84,7 @@ GITHUB_TOKEN="$(gh auth token)" \
 cloud_agent/.venv/bin/python -m cloud_agent.service.worker \
   --once \
   --execution-delay 30 \
-  --log-file cloud_agent/logs/manual_crash_recovery.log &
+  --log-file cloud_agent/logs/01_manual_crash_recovery.log &
 export WORKER_A_PID=$!
 echo "Worker A PID: $WORKER_A_PID"
 ```
@@ -129,7 +129,7 @@ The log shows the claim and delay:
 
 ```bash
 rg "$RUN_ID|execution_delayed" \
-  cloud_agent/logs/manual_crash_recovery.log
+  cloud_agent/logs/01_manual_crash_recovery.log
 ```
 
 SQLite reports `RUNNING` with epoch 1:
@@ -173,7 +173,7 @@ In terminal 4, export the shared variables and run:
 GITHUB_TOKEN="$(gh auth token)" \
 cloud_agent/.venv/bin/python -m cloud_agent.service.worker \
   --once \
-  --log-file cloud_agent/logs/manual_crash_recovery.log
+  --log-file cloud_agent/logs/01_manual_crash_recovery.log
 ```
 
 Worker B should auto-claim the stale message and exit after processing one
@@ -184,7 +184,7 @@ run.
 Check the combined worker log:
 
 ```bash
-rg "$RUN_ID" cloud_agent/logs/manual_crash_recovery.log
+rg "$RUN_ID" cloud_agent/logs/01_manual_crash_recovery.log
 ```
 
 The expected sequence is:

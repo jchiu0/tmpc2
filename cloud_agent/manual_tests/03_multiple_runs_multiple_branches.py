@@ -1,10 +1,11 @@
 import argparse
+import importlib
 import json
 import os
 import subprocess
 import uuid
 
-import multiple_runs as support
+support = importlib.import_module("02_multiple_runs")
 
 
 TOKEN = "BRANCH_CONTEXT_TOKEN_4C2B"
@@ -51,7 +52,7 @@ def main() -> None:
         support.ROOT
         / "cloud_agent"
         / "logs"
-        / f"multiple-branches-{test_id}.log"
+        / f"03_multiple-branches-{test_id}.log"
     )
     stream = f"cloud-agents-multiple-branches-{test_id}"
     group = f"multiple-branches-{test_id}-workers"

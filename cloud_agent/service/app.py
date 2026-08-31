@@ -24,6 +24,14 @@ class Repository(BaseModel):
     startingRef: str | None = None
 
 
+class CustomSubagent(BaseModel):
+    name: str = Field(pattern=r"^[a-z0-9-]+$", min_length=1, max_length=64)
+    description: str = Field(min_length=1, max_length=500)
+    prompt: str = Field(min_length=1, max_length=20_000)
+    model: str = Field(default="inherit", min_length=1, max_length=100)
+    readonly: bool = False
+
+
 class CreateAgentRequest(BaseModel):
     prompt: Prompt
     repos: Annotated[list[Repository], Field(min_length=1, max_length=1)]
@@ -31,6 +39,9 @@ class CreateAgentRequest(BaseModel):
     workOnCurrentBranch: bool = False
     autoCreatePR: bool = True
     outputBranch: str | None = None
+    customSubagents: list[CustomSubagent] = Field(
+        default_factory=list, max_length=20
+    )
 
 
 class AgentEnvironment(BaseModel):
@@ -112,6 +123,14 @@ app = FastAPI(title="Local Cloud Agents", lifespan=lifespan)
     status_code=202,
 )
 def create_agent(request: CreateAgentRequest) -> dict:
+    subagent_names = [
+        subagent.name for subagent in request.customSubagents
+    ]
+    if len(subagent_names) != len(set(subagent_names)):
+        raise HTTPException(
+            status_code=422,
+            detail="custom subagent names must be unique",
+        )
     agent_id = f"bc-{uuid.uuid4()}"
     run_id = f"run-{uuid.uuid4()}"
     repository = request.repos[0]
@@ -136,6 +155,9 @@ def create_agent(request: CreateAgentRequest) -> dict:
         auto_create_pr=request.autoCreatePR,
         output_branch=output_branch,
         mcp_url=settings.mcp_url,
+        custom_subagents=tuple(
+            subagent.model_dump() for subagent in request.customSubagents
+        ),
     )
 
     # TODO: Replace this SQLite/Redis dual write with a transactional outbox.

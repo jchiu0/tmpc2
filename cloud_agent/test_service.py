@@ -71,6 +71,14 @@ class ServiceTests(unittest.TestCase):
                             "startingRef": "main",
                         }
                     ],
+                    "customSubagents": [
+                        {
+                            "name": "reviewer",
+                            "description": "Reviews repository changes",
+                            "prompt": "Review changes carefully.",
+                            "readonly": True,
+                        }
+                    ],
                 },
             )
             self.assertEqual(response.status_code, 202)
@@ -85,6 +93,18 @@ class ServiceTests(unittest.TestCase):
             self.assertIsNotNone(stored)
             self.assertEqual(stored["agent_id"], created["agent"]["id"])
             self.assertEqual(stored["prompt"], "Create a README")
+            self.assertEqual(
+                self.store.get_subagents(created["agent"]["id"]),
+                [
+                    {
+                        "name": "reviewer",
+                        "description": "Reviews repository changes",
+                        "prompt": "Review changes carefully.",
+                        "model": "inherit",
+                        "readonly": 1,
+                    }
+                ],
+            )
             queued = self.queue.read("test-consumer", block_ms=10)
             self.assertIsNotNone(queued)
             self.assertEqual(queued.run_id, created["run"]["id"])
@@ -164,6 +184,27 @@ Keep the existing documentation unchanged.
                 json={"prompt": {"text": "Also add tests"}},
             )
             self.assertEqual(missing.status_code, 404)
+
+            duplicate = client.post(
+                "/v1/agents",
+                json={
+                    "prompt": {"text": "Test duplicate definitions"},
+                    "repos": [{"url": "https://github.com/example/repo"}],
+                    "customSubagents": [
+                        {
+                            "name": "reviewer",
+                            "description": "First",
+                            "prompt": "Review once.",
+                        },
+                        {
+                            "name": "reviewer",
+                            "description": "Second",
+                            "prompt": "Review twice.",
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(duplicate.status_code, 422)
 
     def test_claim_checks_agent_and_run_and_counts_retries(self) -> None:
         self.store.initialize()

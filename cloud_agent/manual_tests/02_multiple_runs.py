@@ -182,7 +182,7 @@ def main() -> None:
     branch = f"cursor/multiple-runs-{test_id}"
     database = ROOT / "cloud_agent" / "data" / f"multiple-runs-{test_id}.db"
     log_file = (
-        ROOT / "cloud_agent" / "logs" / f"multiple-runs-{test_id}.log"
+        ROOT / "cloud_agent" / "logs" / f"02_multiple-runs-{test_id}.log"
     )
     stream = f"cloud-agents-multiple-runs-{test_id}"
     group = f"multiple-runs-{test_id}-workers"

@@ -19,11 +19,25 @@ MAX_STEPS = 30
 MAX_FILE_BYTES = 200_000
 MAX_WRITE_BYTES = 1_000_000
 MAX_LISTED_FILES = 500
+MAX_ACTIONS_PER_TURN = 8
+MAX_PARALLEL_ACTIONS = 2
+MAX_DELEGATED_PROMPT_CHARS = 20_000
+MAX_SUBAGENT_RESULT_CHARS = 20_000
+MAX_PR_TITLE_WORDS = 30
 DEFAULT_MCP_URL = "http://127.0.0.1:8765/mcp"
 
 
 class AgentError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SubagentDefinition:
+    name: str
+    description: str
+    prompt: str
+    model: str = "inherit"
+    readonly: bool = False
 
 
 @dataclass(frozen=True)
@@ -33,9 +47,11 @@ class AgentRequest:
     starting_ref: str | None = None
     work_on_current_branch: bool = False
     output_branch: str | None = None
+    auto_create_pr: bool = False
     mcp_url: str = DEFAULT_MCP_URL
     idempotency_key: str | None = None
     history: tuple[dict[str, str], ...] = ()
+    subagents: tuple[SubagentDefinition, ...] = ()
 
 
 EventCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
@@ -155,7 +171,8 @@ def safe_path(root: Path, relative: str, allow_root: bool = False) -> Path:
 
 
 def list_files(root: Path, relative: str = ".") -> list[str]:
-    directory = safe_path(root, relative, allow_root=True)
+    resolved_root = root.resolve()
+    directory = safe_path(resolved_root, relative, allow_root=True)
     if not directory.exists() or not directory.is_dir():
         raise AgentError(f"directory not found: {relative}")
 
@@ -163,7 +180,7 @@ def list_files(root: Path, relative: str = ".") -> list[str]:
     for path in directory.rglob("*"):
         if ".git" in path.parts or path.is_symlink() or not path.is_file():
             continue
-        files.append(path.relative_to(root).as_posix())
+        files.append(path.relative_to(resolved_root).as_posix())
         if len(files) >= MAX_LISTED_FILES:
             break
     return sorted(files)
@@ -193,23 +210,48 @@ def write_file(root: Path, relative: str, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def parse_action(raw: str) -> dict[str, Any]:
+def parse_actions(raw: str) -> list[dict[str, Any]]:
     text = raw.strip()
     if text.startswith("```"):
         lines = text.splitlines()
         if len(lines) >= 3 and lines[-1].strip() == "```":
             text = "\n".join(lines[1:-1])
-    start = text.find("{")
-    end = text.rfind("}")
+    object_start = text.find("{")
+    array_start = text.find("[")
+    starts = [start for start in (object_start, array_start) if start >= 0]
+    start = min(starts) if starts else -1
+    opening = text[start : start + 1]
+    closing = "]" if opening == "[" else "}"
+    end = text.rfind(closing)
     if start < 0 or end < start:
-        raise AgentError(f"Grok did not return a JSON action: {raw[:200]}")
+        raise AgentError(f"Grok did not return JSON actions: {raw[:200]}")
     try:
-        action = json.loads(text[start : end + 1])
+        parsed = json.loads(text[start : end + 1])
     except json.JSONDecodeError as error:
         raise AgentError(f"Grok returned invalid JSON: {error}") from error
-    if not isinstance(action, dict) or not isinstance(action.get("action"), str):
-        raise AgentError("Grok action must be a JSON object with an action field")
-    return action
+    actions = parsed if isinstance(parsed, list) else [parsed]
+    if not actions:
+        raise AgentError("Grok returned an empty action list")
+    if len(actions) > MAX_ACTIONS_PER_TURN:
+        raise AgentError(
+            f"Grok returned more than {MAX_ACTIONS_PER_TURN} actions"
+        )
+    if any(
+        not isinstance(action, dict)
+        or not isinstance(action.get("action"), str)
+        for action in actions
+    ):
+        raise AgentError(
+            "each Grok action must be a JSON object with an action field"
+        )
+    return actions
+
+
+def parse_action(raw: str) -> dict[str, Any]:
+    actions = parse_actions(raw)
+    if len(actions) != 1:
+        raise AgentError("expected exactly one Grok action")
+    return actions[0]
 
 
 def tool_text(result: Any) -> str:
@@ -225,9 +267,16 @@ def tool_text(result: Any) -> str:
     )
 
 
-async def ask(client: Client, messages: list[dict[str, str]]) -> str:
+async def ask(
+    client: Client,
+    messages: list[dict[str, str]],
+    model: str | None = None,
+) -> str:
+    arguments: dict[str, Any] = {"messages": messages}
+    if model and model != "inherit":
+        arguments["model"] = model
     return tool_text(
-        await client.call_tool("ask_grok", {"messages": messages})
+        await client.call_tool("ask_grok", arguments)
     )
 
 
@@ -237,27 +286,72 @@ async def edit_with_grok(
     mcp_url: str,
     on_event: EventCallback | None = None,
     history: tuple[dict[str, str], ...] = (),
-) -> str:
+    subagents: tuple[SubagentDefinition, ...] = (),
+    system_prompt: str | None = None,
+    readonly: bool = False,
+    model: str | None = None,
+    include_title: bool = False,
+) -> str | tuple[str, str]:
     os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
     os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
 
-    instructions = """
+    actions = [
+        '{"action":"list_files","path":"."}',
+        '{"action":"read_file","path":"relative/path"}',
+    ]
+    if not readonly:
+        actions.append(
+            '{"action":"write_file","path":"relative/path",'
+            '"content":"complete file content"}'
+        )
+    if subagents:
+        actions.append(
+            '{"action":"delegate","subagent":"name",'
+            '"prompt":"complete delegated task"}'
+        )
+    finish_action = '{"action":"finish","summary":"short description"}'
+    if include_title:
+        finish_action = (
+            '{"action":"finish","summary":"short description",'
+            '"title":"concise imperative PR title"}'
+        )
+    actions.append(finish_action)
+    instructions = f"""
 You are a coding assistant editing a Git repository through a file-only protocol.
-Respond with exactly one JSON object per turn and no commentary.
+Respond with one JSON object or one JSON array per turn and no commentary.
 Available actions:
-{"action":"list_files","path":"."}
-{"action":"read_file","path":"relative/path"}
-{"action":"write_file","path":"relative/path","content":"complete file content"}
-{"action":"finish","summary":"short description"}
+{chr(10).join(actions)}
 
 Use only relative paths. Inspect relevant files before editing them. Write complete
 file contents. Do not request shell commands. Finish only when the task is done.
 """.strip()
+    if subagents:
+        descriptions = "\n".join(
+            f"- {subagent.name}: {subagent.description}"
+            for subagent in subagents
+        )
+        instructions += f"\n\nAvailable subagents:\n{descriptions}"
+    instructions += f"""
+
+You may return a JSON array of up to {MAX_ACTIONS_PER_TURN} independent actions.
+Only list_files, read_file, and delegations to readonly subagents run in
+parallel, with at most {MAX_PARALLEL_ACTIONS} concurrent actions. Never put
+finish in an action array. Writable actions are always executed sequentially.
+""".rstrip()
+    if include_title:
+        instructions += """
+
+The finish title must summarize the overall change in imperative mood, such as
+"Add request validation". Keep it specific, relevant to the completed work,
+and at most {MAX_PR_TITLE_WORDS} words.
+""".rstrip()
+    if system_prompt:
+        instructions = f"{system_prompt.strip()}\n\n{instructions}"
     current_prompt = f"""
 Task:
 {prompt}
 
-Return the first JSON action.
+Return the first JSON action or action array.
 """.strip()
     messages = [
         {"role": "system", "content": instructions},
@@ -271,48 +365,179 @@ Return the first JSON action.
     )
 
     async with Client(mcp_url) as client:
-        raw = await ask(client, messages)
+        raw = await ask(client, messages, model)
         for _ in range(MAX_STEPS):
-            action = parse_action(raw)
-            name = action["action"]
+            try:
+                current_actions = parse_actions(raw)
+            except AgentError as error:
+                await emit(
+                    on_event,
+                    "conversation.message",
+                    {
+                        "role": "assistant",
+                        "kind": "invalid_action",
+                        "content": raw,
+                    },
+                )
+                correction = f"""
+Action error:
+{error}
+
+Return corrected valid JSON with escaped string content.
+""".strip()
+                await emit(
+                    on_event,
+                    "conversation.message",
+                    {
+                        "role": "user",
+                        "kind": "tool_result",
+                        "content": correction,
+                    },
+                )
+                messages.extend(
+                    [
+                        {"role": "assistant", "content": raw},
+                        {"role": "user", "content": correction},
+                    ]
+                )
+                raw = await ask(client, messages, model)
+                continue
+            names = [action["action"] for action in current_actions]
             await emit(
                 on_event,
                 "conversation.message",
                 {
                     "role": "assistant",
                     "kind": (
-                        "final_response" if name == "finish" else "tool_call"
+                        "final_response"
+                        if names == ["finish"]
+                        else "tool_call"
                     ),
                     "content": raw,
                 },
             )
-            if name == "finish":
-                return str(
-                    action.get("summary", "Completed requested changes")
+            if names == ["finish"]:
+                summary = str(
+                    current_actions[0].get(
+                        "summary", "Completed requested changes"
+                    )
                 )
-            if name == "list_files":
-                result: Any = {
-                    "files": list_files(workspace, str(action.get("path", ".")))
-                }
-            elif name == "read_file":
-                result = {
-                    "path": action.get("path"),
-                    "content": read_file(workspace, str(action.get("path", ""))),
-                }
-            elif name == "write_file":
-                path = str(action.get("path", ""))
-                content = action.get("content")
-                if not isinstance(content, str):
-                    raise AgentError("write_file content must be a string")
-                write_file(workspace, path, content)
-                result = {"written": path}
+                if include_title:
+                    title = str(current_actions[0].get("title", "")).strip()
+                    if not title:
+                        title = summary
+                    return summary, " ".join(
+                        title.split()[:MAX_PR_TITLE_WORDS]
+                    )
+                return summary
+            if "finish" in names:
+                results: list[Any] = [
+                    {"error": "finish must be the only action in its turn"}
+                ]
             else:
-                result = {"error": f"unknown action: {name}"}
+                async def execute_action(action: dict[str, Any]) -> Any:
+                    name = action["action"]
+                    if name == "list_files":
+                        return {
+                            "files": list_files(
+                                workspace, str(action.get("path", "."))
+                            )
+                        }
+                    if name == "read_file":
+                        return {
+                            "path": action.get("path"),
+                            "content": read_file(
+                                workspace, str(action.get("path", ""))
+                            ),
+                        }
+                    if name == "write_file":
+                        if readonly:
+                            return {"error": "subagent is readonly"}
+                        path = str(action.get("path", ""))
+                        content = action.get("content")
+                        if not isinstance(content, str):
+                            raise AgentError(
+                                "write_file content must be a string"
+                            )
+                        write_file(workspace, path, content)
+                        return {"written": path}
+                    if name != "delegate":
+                        return {"error": f"unknown action: {name}"}
+
+                    subagent_name = action.get("subagent")
+                    delegated_prompt = action.get("prompt")
+                    definition = next(
+                        (
+                            subagent
+                            for subagent in subagents
+                            if subagent.name == subagent_name
+                        ),
+                        None,
+                    )
+                    if definition is None:
+                        return {
+                            "error": f"unknown subagent: {subagent_name}"
+                        }
+                    if (
+                        not isinstance(delegated_prompt, str)
+                        or not delegated_prompt.strip()
+                    ):
+                        return {
+                            "error": "delegate prompt must be non-empty"
+                        }
+                    if len(delegated_prompt) > MAX_DELEGATED_PROMPT_CHARS:
+                        return {
+                            "error": (
+                                "delegate prompt exceeds "
+                                f"{MAX_DELEGATED_PROMPT_CHARS} characters"
+                            )
+                        }
+                    return await run_subagent(
+                        workspace,
+                        definition,
+                        delegated_prompt,
+                        mcp_url,
+                        on_event,
+                    )
+
+                def parallel_safe(action: dict[str, Any]) -> bool:
+                    if action["action"] in {"list_files", "read_file"}:
+                        return True
+                    if action["action"] != "delegate":
+                        return False
+                    return any(
+                        subagent.name == action.get("subagent")
+                        and subagent.readonly
+                        for subagent in subagents
+                    )
+
+                if len(current_actions) > 1 and all(
+                    parallel_safe(action) for action in current_actions
+                ):
+                    results = []
+                    for start in range(
+                        0, len(current_actions), MAX_PARALLEL_ACTIONS
+                    ):
+                        results.extend(
+                            await asyncio.gather(
+                                *(
+                                    execute_action(action)
+                                    for action in current_actions[
+                                        start : start
+                                        + MAX_PARALLEL_ACTIONS
+                                    ]
+                                )
+                            )
+                        )
+                else:
+                    results = []
+                    for action in current_actions:
+                        results.append(await execute_action(action))
 
             tool_result = f"""
 Action result:
-{json.dumps(result)}
-Return the next JSON action.
+{json.dumps(results[0] if len(results) == 1 else {"results": results})}
+Return the next JSON action or action array.
 """.strip()
             await emit(
                 on_event,
@@ -329,8 +554,75 @@ Return the next JSON action.
                     {"role": "user", "content": tool_result},
                 ]
             )
-            raw = await ask(client, messages)
+            raw = await ask(client, messages, model)
     raise AgentError(f"Grok exceeded the {MAX_STEPS}-step limit")
+
+
+async def run_subagent(
+    workspace: Path,
+    definition: SubagentDefinition,
+    prompt: str,
+    mcp_url: str,
+    on_event: EventCallback | None,
+) -> dict[str, str]:
+    subagent_id = f"subagent-{uuid.uuid4()}"
+    await emit(
+        on_event,
+        "subagent.started",
+        {
+            "subagentId": subagent_id,
+            "name": definition.name,
+            "prompt": prompt,
+        },
+    )
+
+    async def child_event(event_type: str, payload: dict[str, Any]) -> None:
+        if event_type == "conversation.message":
+            await emit(
+                on_event,
+                "subagent.message",
+                {
+                    "subagentId": subagent_id,
+                    "name": definition.name,
+                    **payload,
+                },
+            )
+
+    try:
+        result = await edit_with_grok(
+            workspace,
+            prompt,
+            mcp_url,
+            on_event=child_event,
+            system_prompt=definition.prompt,
+            readonly=definition.readonly,
+            model=definition.model,
+        )
+    except Exception as error:
+        await emit(
+            on_event,
+            "subagent.error",
+            {
+                "subagentId": subagent_id,
+                "name": definition.name,
+                "error": str(error),
+            },
+        )
+        raise
+
+    await emit(
+        on_event,
+        "subagent.finished",
+        {
+            "subagentId": subagent_id,
+            "name": definition.name,
+            "result": result,
+        },
+    )
+    return {
+        "subagentId": subagent_id,
+        "result": result[:MAX_SUBAGENT_RESULT_CHARS],
+    }
 
 
 async def run_agent(
@@ -357,6 +649,32 @@ async def run_agent(
             output_branch,
             request.prompt,
         )
+
+        def add_pull_request(
+            result: dict[str, Any], summary: str, title: str | None = None
+        ) -> dict[str, Any]:
+            if not request.auto_create_pr:
+                return result
+            if branch == starting_ref:
+                raise AgentError(
+                    "autoCreatePR requires an output branch different "
+                    "from startingRef"
+                )
+            result["pullRequest"] = github.ensure_pull_request(
+                head=branch,
+                base=starting_ref,
+                title=" ".join(
+                    (title or summary or request.prompt).split()[
+                        :MAX_PR_TITLE_WORDS
+                    ]
+                ),
+                body=(
+                    "Created by local Cloud Agent run "
+                    f"`{request.idempotency_key or 'unknown'}`."
+                ),
+            )
+            return result
+
         existing_output_sha = github.get_ref(branch)
         marker = (
             commit_marker(request.idempotency_key)
@@ -369,12 +687,16 @@ async def run_agent(
             else ""
         )
         if existing_output_sha and marker and existing_message.startswith(marker):
-            return recovered_result(
-                request,
-                starting_ref,
-                branch,
-                existing_output_sha,
-                existing_message.removeprefix(marker).strip(),
+            recovered_summary = existing_message.removeprefix(marker).strip()
+            return add_pull_request(
+                recovered_result(
+                    request,
+                    starting_ref,
+                    branch,
+                    existing_output_sha,
+                    recovered_summary,
+                ),
+                recovered_summary,
             )
         if not request.work_on_current_branch and existing_output_sha:
             raise AgentError(f"output branch already exists: {branch}")
@@ -385,13 +707,20 @@ async def run_agent(
             original_digest = workspace_digest(workspace)
 
             await emit(on_event, "agent.status", {"status": "running"})
-            summary = await edit_with_grok(
+            completion = await edit_with_grok(
                 workspace,
                 request.prompt,
                 request.mcp_url,
                 on_event,
                 request.history,
+                request.subagents,
+                include_title=request.auto_create_pr,
             )
+            if isinstance(completion, tuple):
+                summary, pull_request_title = completion
+            else:
+                summary = completion
+                pull_request_title = None
             if workspace_digest(workspace) == original_digest:
                 return {
                     "status": "no_changes",
@@ -423,17 +752,25 @@ async def run_agent(
                     or not github.commit_message(published_sha).startswith(marker)
                 ):
                     raise
-                return recovered_result(
-                    request, starting_ref, branch, published_sha
+                return add_pull_request(
+                    recovered_result(
+                        request, starting_ref, branch, published_sha
+                    ),
+                    summary,
+                    pull_request_title,
                 )
-            return {
-                "status": "finished",
-                "repo": request.repo,
-                "startingRef": starting_ref,
-                "workOnCurrentBranch": request.work_on_current_branch,
-                "branch": branch,
-                "commit": commit,
-                "summary": summary,
-            }
+            return add_pull_request(
+                {
+                    "status": "finished",
+                    "repo": request.repo,
+                    "startingRef": starting_ref,
+                    "workOnCurrentBranch": request.work_on_current_branch,
+                    "branch": branch,
+                    "commit": commit,
+                    "summary": summary,
+                },
+                summary,
+                pull_request_title,
+            )
     finally:
         github.close()

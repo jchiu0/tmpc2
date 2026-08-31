@@ -1,5 +1,6 @@
 fastapi
 httpx
 mcp[cli]
+pytest
 redis
 uvicorn

@@ -81,6 +81,18 @@ class AgentStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS agent_subagents (
+                    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT 'inherit',
+                    readonly INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, name)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_runs_agent_id
                     ON runs(agent_id, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_run_per_agent
@@ -134,6 +146,7 @@ class AgentStore:
         auto_create_pr: bool,
         output_branch: str | None,
         mcp_url: str,
+        custom_subagents: tuple[dict[str, Any], ...] = (),
     ) -> dict[str, Any]:
         timestamp = now()
         with self._connection() as connection:
@@ -185,6 +198,25 @@ class AgentStore:
                 {"status": "CREATING"},
                 timestamp,
             )
+            for subagent in custom_subagents:
+                connection.execute(
+                    """
+                    INSERT INTO agent_subagents (
+                        agent_id, name, description, prompt, model, readonly,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        agent_id,
+                        subagent["name"],
+                        subagent["description"],
+                        subagent["prompt"],
+                        subagent.get("model", "inherit"),
+                        int(subagent.get("readonly", False)),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
         return {
             "agent": {
                 "id": agent_id,
@@ -371,13 +403,28 @@ class AgentStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT runs.*, agents.repo_url, agents.status AS agent_status
+                SELECT runs.*, agents.repo_url,
+                       agents.status AS agent_status,
+                       agents.auto_create_pr
                 FROM runs JOIN agents USING (agent_id)
                 WHERE run_id = ?
                 """,
                 (run_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def get_subagents(self, agent_id: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT name, description, prompt, model, readonly
+                FROM agent_subagents
+                WHERE agent_id = ?
+                ORDER BY name
+                """,
+                (agent_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_events(
         self, run_id: str, after_id: int = 0, limit: int = 100
@@ -401,7 +448,9 @@ class AgentStore:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT runs.*, agents.repo_url, agents.status AS agent_status
+                SELECT runs.*, agents.repo_url,
+                       agents.status AS agent_status,
+                       agents.auto_create_pr
                 FROM runs JOIN agents USING (agent_id)
                 WHERE run_id = ?
                 """,
@@ -441,7 +490,9 @@ class AgentStore:
                 )
             claimed = connection.execute(
                 """
-                SELECT runs.*, agents.repo_url, agents.status AS agent_status
+                SELECT runs.*, agents.repo_url,
+                       agents.status AS agent_status,
+                       agents.auto_create_pr
                 FROM runs JOIN agents USING (agent_id)
                 WHERE run_id = ?
                 """,

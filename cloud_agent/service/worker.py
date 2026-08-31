@@ -11,7 +11,12 @@ from typing import Any
 
 from redis.exceptions import RedisError
 
-from cloud_agent.lib import AgentRequest, EventCallback, run_agent
+from cloud_agent.lib import (
+    AgentRequest,
+    EventCallback,
+    SubagentDefinition,
+    run_agent,
+)
 
 from .config import load_settings
 from .queue import AgentQueue, QueueMessage
@@ -63,15 +68,28 @@ def process_message(
         starting_ref=run["starting_ref"],
         work_on_current_branch=bool(run["work_on_current_branch"]),
         output_branch=run["output_branch"],
+        auto_create_pr=bool(run["auto_create_pr"]),
         mcp_url=run["mcp_url"],
         idempotency_key=message.run_id,
         history=tuple(store.conversation_before(message.run_id)),
+        subagents=tuple(
+            SubagentDefinition(
+                name=subagent["name"],
+                description=subagent["description"],
+                prompt=subagent["prompt"],
+                model=subagent["model"],
+                readonly=bool(subagent["readonly"]),
+            )
+            for subagent in store.get_subagents(run["agent_id"])
+        ),
     )
 
     def save_event(event_type: str, payload: dict) -> None:
         if not queue.refresh_lease(consumer, message.message_id):
             raise StaleExecutionError(message.run_id)
-        if event_type == "conversation.message":
+        if event_type == "conversation.message" or event_type.startswith(
+            "subagent."
+        ):
             payload = {**payload, "attempt": epoch}
         store.append_event(message.run_id, epoch, event_type, payload)
         if event_type == "agent.status" and payload.get("status") == "running":
